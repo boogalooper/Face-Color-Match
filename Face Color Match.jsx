@@ -1,10 +1,32 @@
 ﻿#target photoshop
+/*
+ // BEGIN__HARVEST_EXCEPTION_ZSTRING
+ <javascriptresource>
+ <name>Face Color Match</name>
+ <eventid>db558f66-6e38-41e7-a274-70537f4632af</eventid>
+ <terminology><![CDATA[<< /Version 1
+    /Events <<
+        /db558f66-6e38-41e7-a274-70537f4632af [(Face Color Match) <<
+            /selectedPresetId [(preset id) /string]
+            /mode [(matching mode) /string]
+            /minimumGain [(minimum Delta E gain) /double]
+            /useMaster [(use master curve) /boolean]
+            /strength [(strength) /integer]
+            /layerName [(layer name) /string]
+            /skipNoFace [(skip if no face) /boolean]
+        >>]
+    >>
+ >> ]]></terminology>
+ </javascriptresource>
+ // END__HARVEST_EXCEPTION_ZSTRING
+*/
 app.bringToFront();
 
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.1.7",
+            version: "0.6.0",
+            uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
@@ -17,6 +39,8 @@ app.bringToFront();
         },
         c2t = charIDToTypeID,
         s2t = stringIDToTypeID,
+        t2s = typeIDToStringID,
+        descriptorCodec = new DescriptorCodec(),
         cfg = new Config(),
         api = new BridgeApi(),
         action = new ActionRuntime(),
@@ -36,14 +60,11 @@ app.bringToFront();
         cfg.ensurePresetFolder();
 
         actionPlaybackMode = action.isPlayback();
-        if (actionPlaybackMode) {
-            var recordedSettings = action.getRecordedSettingsMode();
-            if (recordedSettings) action.loadFromAction();
-            else cfg.data.recordSettingsToAction = false;
-        }
+        if (actionPlaybackMode) action.loadFromAction();
 
+        // Manual launch always shows the interface. During Action playback the
+        // standard Photoshop dialog toggle controls whether the UI is shown.
         var showInterface = !actionPlaybackMode || action.hasInterfaceArgument() ||
-            ScriptUI.environment.keyboardState.shiftKey ||
             (actionPlaybackMode && app.playbackDisplayDialogs == DialogModes.ALL);
         api.initialize();
 
@@ -63,34 +84,73 @@ app.bringToFront();
     }
 
     // -------------------- UI --------------------
+    // ---
+    // ИНТЕРФЕЙС
+    // Размеры и общие операции ScriptUI собраны здесь, как в img2img helper.
+    // ---
     function UI() {
         var self = this;
+
         this.mainWindowWidth = 370;
         this.labelWidth = 78;
-        this.buttonWidth = 28;
-        this.createDialog = function (title) {
-            var w = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:8,margins:15}");
-            w.text = title;
-            return w;
-        };
-        this.setWidth = function (control, width) {
-            control.preferredSize.width = control.minimumSize.width = control.maximumSize.width = width;
+        this.mainSettingsButtonWidth = 28;
+        this.presetButtonWidth = 28;
+        this.sliderWidth = 170;
+        this.sliderValueWidth = 46;
+        this.progressWidth = 330;
+
+        this.setFixedWidth = function (control, width) {
+            width = Math.max(0, Number(width) || 0);
+            control.preferredSize.width =
+                control.minimumSize.width =
+                control.maximumSize.width = width;
             return control;
         };
+
+        this.createDialog = function (options) {
+            if (typeof options == "string") options = { title: options };
+            options = options || {};
+
+            var spacing = options.spacing === undefined ? 8 : options.spacing,
+                margins = options.margins === undefined ? 15 : options.margins,
+                marginsText = margins instanceof Array
+                    ? "[" + margins.join(",") + "]"
+                    : margins,
+                dialog = new Window(
+                    "dialog{orientation:'column',alignChildren:['fill','top'],spacing:" +
+                    spacing + ",margins:" + marginsText + "}"
+                );
+
+            dialog.text = options.title || APP.name;
+            return dialog;
+        };
+
+        this.showDialog = function (dialog) {
+            dialog.center();
+            return dialog.show();
+        };
+
         this.progress = function (title, fn) {
-            if (actionPlaybackMode && !interfaceWasShown) return fn(function () { });
-            var w = new Window("palette{orientation:'column',alignChildren:['fill','top'],spacing:8,margins:12}"),
+            if (actionPlaybackMode && !interfaceWasShown)
+                return fn(function () { });
+
+            var w = new Window(
+                    "palette{orientation:'column',alignChildren:['fill','top'],spacing:8,margins:12}"
+                ),
                 text = w.add("statictext", undefined, title),
                 bar = w.add("progressbar", undefined, 0, 100);
+
             w.text = APP.name;
-            self.setWidth(text, 330);
-            self.setWidth(bar, 330);
+            self.setFixedWidth(text, self.progressWidth);
+            self.setFixedWidth(bar, self.progressWidth);
             bar.value = 5;
             w.show();
+
             try {
                 return fn(function (message, value) {
                     if (message) text.text = message;
-                    if (value !== undefined) bar.value = Math.max(0, Math.min(100, value));
+                    if (value !== undefined)
+                        bar.value = Math.max(0, Math.min(100, value));
                     try { w.update(); } catch (_) { }
                 });
             } finally {
@@ -112,27 +172,31 @@ app.bringToFront();
             bUpdate = presetGroup.add("button", undefined, "↻"),
             modeGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             tMode = modeGroup.add("statictext", undefined, str.mode),
-            ddMode = modeGroup.add("dropdownlist", undefined, [str.modePrecise, str.modeSafe]),
+            ddMode = modeGroup.add("dropdownlist", undefined, [str.modeParametric, str.modeResidualLut]),
             strengthGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             tStrength = strengthGroup.add("statictext", undefined, str.strength),
             slStrength = strengthGroup.add("slider", undefined, cfg.data.strength, 0, 100),
             tStrengthValue = strengthGroup.add("statictext", undefined, String(Math.round(cfg.data.strength)) + "%"),
+            gainGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
+            tGain = gainGroup.add("statictext", undefined, str.minimumGain),
+            slGain = gainGroup.add("slider", undefined, cfg.data.minimumGain, 0, 2),
+            tGainValue = gainGroup.add("statictext", undefined, oneDecimal(cfg.data.minimumGain)),
             gOk = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,6,0,0]}"),
             bOk = gOk.add("button", undefined, str.apply, { name: "ok" }),
             bCancel = gOk.add("button", undefined, str.cancel, { name: "cancel" });
 
-        ui.setWidth(w, ui.mainWindowWidth);
+        ui.setFixedWidth(w, ui.mainWindowWidth);
         tHeader.alignment = ["fill", "center"];
         bSettings.alignment = ["right", "center"];
-        ui.setWidth(bSettings, ui.buttonWidth);
-        ui.setWidth(tPreset, ui.labelWidth); ui.setWidth(tMode, ui.labelWidth); ui.setWidth(tStrength, ui.labelWidth);
-        ui.setWidth(ddPreset, 190); ui.setWidth(ddMode, 205); ui.setWidth(slStrength, 170); ui.setWidth(tStrengthValue, 46);
-        ui.setWidth(bAdd, ui.buttonWidth); ui.setWidth(bUpdate, ui.buttonWidth);
+        ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
+        ui.setFixedWidth(tPreset, ui.labelWidth); ui.setFixedWidth(tMode, ui.labelWidth); ui.setFixedWidth(tStrength, ui.labelWidth); ui.setFixedWidth(tGain, ui.labelWidth);
+        ui.setFixedWidth(ddPreset, 190); ui.setFixedWidth(ddMode, 205); ui.setFixedWidth(slStrength, ui.sliderWidth); ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth); ui.setFixedWidth(slGain, ui.sliderWidth); ui.setFixedWidth(tGainValue, ui.sliderValueWidth);
+        ui.setFixedWidth(bAdd, ui.presetButtonWidth); ui.setFixedWidth(bUpdate, ui.presetButtonWidth);
         bSettings.helpTip = str.settings;
         bAdd.helpTip = str.createPresetHelp;
         bUpdate.helpTip = str.updatePresetHelp;
 
-        ddMode.selection = cfg.data.mode == "safe" ? 1 : 0;
+        ddMode.selection = cfg.data.mode == "residual_lut" ? 1 : 0;
 
         function selectedPreset() {
             if (!ddPreset.selection) return null;
@@ -160,9 +224,17 @@ app.bringToFront();
             var item = selectedPreset();
             if (item) cfg.data.selectedPresetId = String(item.id || "");
         };
-        ddMode.onChange = function () { cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "safe" : "precise"; };
+        ddMode.onChange = function () { cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric"; };
         slStrength.onChanging = function () { tStrengthValue.text = String(Math.round(slStrength.value)) + "%"; };
         slStrength.onChange = function () { cfg.data.strength = Math.round(slStrength.value); tStrengthValue.text = String(cfg.data.strength) + "%"; };
+        slGain.onChanging = function () {
+            var value = Math.round(Number(slGain.value) * 10) / 10;
+            tGainValue.text = value.toFixed(1);
+        };
+        slGain.onChange = function () {
+            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
+            tGainValue.text = cfg.data.minimumGain.toFixed(1);
+        };
 
         bAdd.onClick = function () {
             var defaultName = stripExtension(app.activeDocument.name),
@@ -200,13 +272,16 @@ app.bringToFront();
 
         bSettings.onClick = function () {
             cfg.data.strength = Math.round(slStrength.value);
-            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "safe" : "precise";
+            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
+            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric";
             var oldFolder = cfg.data.presetFolder;
             if (settingsDialog()) {
                 if (oldFolder != cfg.data.presetFolder) refreshPresets(cfg.data.selectedPresetId);
-                ddMode.selection = cfg.data.mode == "safe" ? 1 : 0;
+                ddMode.selection = cfg.data.mode == "residual_lut" ? 1 : 0;
                 slStrength.value = cfg.data.strength;
                 tStrengthValue.text = String(Math.round(cfg.data.strength)) + "%";
+                slGain.value = cfg.data.minimumGain;
+                tGainValue.text = Number(cfg.data.minimumGain).toFixed(1);
             }
         };
 
@@ -214,13 +289,15 @@ app.bringToFront();
             var item = selectedPreset();
             if (!item) return;
             cfg.data.selectedPresetId = String(item.id || "");
-            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "safe" : "precise";
+            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric";
             cfg.data.strength = Math.round(slStrength.value);
+            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
             w.close(1);
         };
         bCancel.onClick = function () { w.close(0); };
-        w.center();
-        return w.show() == 1 ? { cancelled: false } : { cancelled: true };
+        return ui.showDialog(w) == 1
+            ? { cancelled: false }
+            : { cancelled: true };
     }
 
     function settingsDialog() {
@@ -229,24 +306,13 @@ app.bringToFront();
             pGeneral = w.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:7,margins:10}"),
             folderRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             folderLabel = folderRow.add("statictext", undefined, str.presetFolder),
-            folderEdit = folderRow.add("edittext", undefined, temp.presetFolder),
+            folderEdit = folderRow.add("edittext", undefined, normalizeFolderPath(temp.presetFolder)),
             folderButton = folderRow.add("button", undefined, "..."),
-            pyRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
-            pyLabel = pyRow.add("statictext", undefined, str.pythonVersion),
-            pyDrop = pyRow.add("dropdownlist", undefined, [str.pythonAuto, "3.11", "3.14"]),
             previewRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             previewLabel = previewRow.add("statictext", undefined, str.previewSize),
             previewEdit = previewRow.add("edittext", undefined, String(temp.previewSize)),
-            pointsRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
-            pointsLabel = pointsRow.add("statictext", undefined, str.maxPoints),
-            pointsDrop = pointsRow.add("dropdownlist", undefined, [str.auto, "2", "3", "4"]),
-            toleranceRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
-            toleranceLabel = toleranceRow.add("statictext", undefined, str.colorTolerance),
-            toleranceEdit = toleranceRow.add("edittext", undefined, String(temp.colorTolerance)),
             master = pGeneral.add("checkbox", undefined, str.useMaster),
-            record = pGeneral.add("checkbox", undefined, str.recordToAction),
             skip = pGeneral.add("checkbox", undefined, str.skipNoFace),
-            diag = pGeneral.add("checkbox", undefined, str.showDiagnostics),
             layerRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             layerLabel = layerRow.add("statictext", undefined, str.layerName),
             layerEdit = layerRow.add("edittext", undefined, temp.layerName),
@@ -257,43 +323,51 @@ app.bringToFront();
 
         pGeneral.text = str.general;
         var lw = 165;
-        ui.setWidth(folderLabel, lw); ui.setWidth(pyLabel, lw); ui.setWidth(previewLabel, lw); ui.setWidth(pointsLabel, lw); ui.setWidth(toleranceLabel, lw); ui.setWidth(layerLabel, lw);
-        ui.setWidth(folderEdit, 270); ui.setWidth(folderButton, 30); ui.setWidth(pyDrop, 120); ui.setWidth(previewEdit, 80); ui.setWidth(pointsDrop, 120); ui.setWidth(toleranceEdit, 80); ui.setWidth(layerEdit, 220); ui.setWidth(info, 455);
-        master.value = !!temp.useMaster; record.value = !!temp.recordSettingsToAction; skip.value = !!temp.skipNoFace; diag.value = !!temp.showDiagnostics;
-        pyDrop.selection = temp.pythonVersion == "3.11" ? 1 : (temp.pythonVersion == "3.14" ? 2 : 0);
-        pointsDrop.selection = temp.maxPoints == 2 ? 1 : (temp.maxPoints == 3 ? 2 : (temp.maxPoints == 4 ? 3 : 0));
+        ui.setFixedWidth(folderLabel, lw);
+        ui.setFixedWidth(previewLabel, lw);
+        ui.setFixedWidth(layerLabel, lw);
+        ui.setFixedWidth(folderEdit, 270);
+        ui.setFixedWidth(folderButton, 30);
+        ui.setFixedWidth(previewEdit, 80);
+        ui.setFixedWidth(layerEdit, 220);
+        ui.setFixedWidth(info, 455);
+
+        master.value = !!temp.useMaster;
+        skip.value = !!temp.skipNoFace;
 
         folderButton.onClick = function () {
-            var baseFolder = new Folder(folderEdit.text), selected = baseFolder.exists ? baseFolder.selectDlg(str.selectPresetFolder) : Folder.selectDialog(str.selectPresetFolder);
+            var baseFolder = new Folder(folderEdit.text),
+                selected = baseFolder.exists
+                    ? baseFolder.selectDlg(str.selectPresetFolder)
+                    : Folder.selectDialog(str.selectPresetFolder);
             if (selected) folderEdit.text = selected.fsName;
         };
+
         ok.onClick = function () {
-            var folder = trim(folderEdit.text), preview = parseInt(previewEdit.text, 10), tolerance = Number(String(toleranceEdit.text).replace(",", ".")), layer = trim(layerEdit.text);
+            var folder = trim(folderEdit.text),
+                preview = parseInt(previewEdit.text, 10),
+                layer = trim(layerEdit.text);
             if (!folder) { alert(str.folderRequired, APP.name, true); return; }
             if (isNaN(preview)) preview = 1400;
             preview = Math.max(640, Math.min(3000, preview));
-            if (isNaN(tolerance)) tolerance = 2.0;
-            tolerance = Math.max(0, Math.min(10, tolerance));
-            temp.presetFolder = folder;
-            temp.pythonVersion = pyDrop.selection && pyDrop.selection.index == 1 ? "3.11" : (pyDrop.selection && pyDrop.selection.index == 2 ? "3.14" : "auto");
+
+            temp.presetFolder = normalizeFolderPath(folder);
             temp.previewSize = preview;
-            temp.maxPoints = pointsDrop.selection ? [0, 2, 3, 4][pointsDrop.selection.index] : 0;
-            temp.colorTolerance = tolerance;
             temp.useMaster = !!master.value;
-            temp.recordSettingsToAction = !!record.value;
             temp.skipNoFace = !!skip.value;
-            temp.showDiagnostics = !!diag.value;
             temp.layerName = layer || "Face Color Match";
             cfg.data = temp;
             cfg.ensurePresetFolder();
             w.close(1);
         };
+
         cancel.onClick = function () { w.close(0); };
-        w.center();
-        return w.show() == 1;
+        return ui.showDialog(w) == 1;
     }
 
-    // -------------------- Main operation --------------------
+    // ---
+    // ОСНОВНАЯ ОПЕРАЦИЯ
+    // ---
     function executeCurrentMatch(showProgress) {
         if (!cfg.data.selectedPresetId) throw new Error(str.noPresetSelected);
         var result;
@@ -311,21 +385,8 @@ app.bringToFront();
             if (e && e.code == "NO_FACE" && cfg.data.skipNoFace) return;
             throw e;
         }
-        if (!result || !result.curves) throw new Error(str.invalidCurveResult);
-        createCurvesLayer(result.curves, result.use_master !== undefined ? !!result.use_master : cfg.data.useMaster, layerTitle(result), cfg.data.strength);
-        if (cfg.data.showDiagnostics && interfaceWasShown && result.diagnostics) {
-            alert(
-                str.diagnostics + "\n\n" +
-                "ΔE00: " + result.diagnostics.delta_e_before + " → " + result.diagnostics.delta_e_after + "\n" +
-                str.improvement + ": " + result.diagnostics.improvement_percent + "%\n" +
-                str.correspondences + ": " + result.diagnostics.correspondences + "\n" +
-                str.curvePoints + ": " + (result.diagnostics.internal_points || 0) + "\n" +
-                str.tolerance + ": " + result.diagnostics.tolerance + " ΔE\n" +
-                str.lumaError + ": " + result.diagnostics.luma_error_before + " → " + result.diagnostics.luma_error_after + "\n" +
-                str.maxBend + ": " + result.diagnostics.max_bend,
-                APP.name
-            );
-        }
+        if (!result) throw new Error(str.invalidCurveResult);
+        applyParametricResult(result, layerTitle(result), cfg.data.strength);
     }
 
     function layerTitle(result) {
@@ -344,6 +405,51 @@ app.bringToFront();
         return String(Math.round(n * 10) / 10);
     }
 
+    function whiteBalanceLayerName(result) {
+        var diag = result && result.diagnostics ? result.diagnostics : null;
+        if (diag && diag.delta_e_before !== undefined && diag.delta_e_after_wb !== undefined) {
+            return "White Balance ΔE " + oneDecimal(diag.delta_e_before) + "→" + oneDecimal(diag.delta_e_after_wb);
+        }
+        return "White Balance";
+    }
+
+    function toneLayerName(result) {
+        var diag = result && result.diagnostics ? result.diagnostics : null,
+            fromValue = diag && diag.delta_e_after_wb !== undefined
+                ? diag.delta_e_after_wb
+                : (diag ? diag.delta_e_before : undefined);
+        if (
+            diag && fromValue !== undefined &&
+            diag.delta_e_after_tone !== undefined
+        ) {
+            return "Tone ΔE " + oneDecimal(fromValue) + "→" +
+                oneDecimal(diag.delta_e_after_tone);
+        }
+        return "Tone";
+    }
+
+    function skinColorLayerName(lut) {
+        if (
+            lut && lut.delta_e_before !== undefined &&
+            lut.delta_e_after !== undefined
+        ) {
+            return "Skin Color ΔE " + oneDecimal(lut.delta_e_before) + "→" +
+                oneDecimal(lut.delta_e_after);
+        }
+        return "Skin Color";
+    }
+
+    function residualLutLayerName(lut) {
+        if (
+            lut && lut.delta_e_before !== undefined &&
+            lut.delta_e_after !== undefined
+        ) {
+            return "Residual LUT ΔE " + oneDecimal(lut.delta_e_before) + "→" +
+                oneDecimal(lut.delta_e_after);
+        }
+        return "Residual LUT";
+    }
+
     function withPreview(callback) {
         var file = null;
         try {
@@ -357,7 +463,7 @@ app.bringToFront();
     function createPreview(maxSize) {
         var original = app.activeDocument,
             temp = null,
-            file = new File(Folder.temp.fsName + "/face-color-match-" + (new Date()).getTime() + "-" + Math.floor(Math.random() * 1000000) + ".png");
+            file = new File(Folder.temp.fsName + "/face-color-match-" + (new Date()).getTime() + "-" + Math.floor(Math.random() * 1000000) + ".jpg");
         try {
             temp = original.duplicate("Face Color Match preview", true);
             app.activeDocument = temp;
@@ -370,8 +476,12 @@ app.bringToFront();
                 if (w >= h) temp.resizeImage(UnitValue(size, "px"), null, null, ResampleMethod.BICUBICSHARPER);
                 else temp.resizeImage(null, UnitValue(size, "px"), null, ResampleMethod.BICUBICSHARPER);
             }
-            var options = new PNGSaveOptions();
-            options.interlaced = false;
+            try { temp.flatten(); } catch (_) { }
+            var options = new JPEGSaveOptions();
+            options.quality = 10;
+            options.embedColorProfile = true;
+            options.matte = MatteType.NONE;
+            options.formatOptions = FormatOptions.STANDARDBASELINE;
             temp.saveAs(file, options, true, Extension.LOWERCASE);
             temp.close(SaveOptions.DONOTSAVECHANGES);
             temp = null;
@@ -385,7 +495,77 @@ app.bringToFront();
         }
     }
 
-    function createCurvesLayer(curves, useMaster, name, opacity) {
+
+    function applyParametricResult(result, groupName, opacity) {
+        var doc = app.activeDocument,
+            group = doc.layerSets.add(),
+            skinLut = result.skin_lut || null,
+            residualLut = result.residual_lut || null,
+            created = 0;
+
+        try {
+            try { group.name = groupName; } catch (_) { }
+            try {
+                group.opacity = Math.max(0, Math.min(100, Number(opacity)));
+            } catch (_) { }
+
+            if (result.wb_curves) {
+                createCurvesLayer(
+                    result.wb_curves,
+                    false,
+                    whiteBalanceLayerName(result),
+                    100,
+                    group
+                );
+                created++;
+            }
+
+            if (result.tone_curves) {
+                createCurvesLayer(
+                    result.tone_curves,
+                    true,
+                    toneLayerName(result),
+                    100,
+                    group
+                );
+                created++;
+            }
+
+            if (skinLut && skinLut.path) {
+                createResidualLutLayer(
+                    String(skinLut.path),
+                    String(skinLut.profile_path || ""),
+                    skinColorLayerName(skinLut),
+                    100,
+                    group
+                );
+                created++;
+            }
+
+            if (residualLut && residualLut.path) {
+                createResidualLutLayer(
+                    String(residualLut.path),
+                    String(residualLut.profile_path || ""),
+                    residualLutLayerName(residualLut),
+                    100,
+                    group
+                );
+                created++;
+            }
+
+            if (!created) {
+                try { group.remove(); } catch (_) { }
+                return;
+            }
+
+            try { doc.activeLayer = group; } catch (_) { }
+        } catch (e) {
+            try { group.remove(); } catch (_) { }
+            throw e;
+        }
+    }
+
+    function createCurvesLayer(curves, useMaster, name, opacity, parentGroup) {
         var doc = app.activeDocument,
             storedChannel = null,
             hadSelection = false;
@@ -416,7 +596,128 @@ app.bringToFront();
             make.putObject(c2t("Usng"), c2t("AdjL"), using);
             executeAction(c2t("Mk  "), make, DialogModes.NO);
             try { app.activeDocument.activeLayer.name = name; } catch (_) { }
-            try { var op = Number(opacity); if (isNaN(op)) op = 100; app.activeDocument.activeLayer.opacity = Math.max(0, Math.min(100, op)); } catch (_) { }
+            try {
+                var op = Number(opacity);
+                if (isNaN(op)) op = 100;
+                app.activeDocument.activeLayer.opacity = Math.max(0, Math.min(100, op));
+            } catch (_) { }
+            if (parentGroup) {
+                try { app.activeDocument.activeLayer.move(parentGroup, ElementPlacement.INSIDE); } catch (_) { }
+            }
+        } finally {
+            if (storedChannel) {
+                try { doc.selection.load(storedChannel, SelectionType.REPLACE); } catch (_) { }
+                try { storedChannel.remove(); } catch (_) { }
+            }
+        }
+    }
+
+    function createResidualLutLayer(cubePath, profilePath, name, opacity, parentGroup) {
+        var doc = app.activeDocument,
+            cubeFile = new File(cubePath),
+            profileFile = new File(profilePath),
+            storedChannel = null,
+            hadSelection = false,
+            layer = null,
+            cubeOpened = false,
+            profileOpened = false;
+
+        if (!cubeFile.exists) throw new Error(str.lutFileMissing + "\n" + cubePath);
+        if (!profilePath || !profileFile.exists) throw new Error(str.lutProfileMissing + "\n" + profilePath);
+
+        try {
+            try { var bounds = doc.selection.bounds; hadSelection = !!bounds; } catch (_) { hadSelection = false; }
+            if (hadSelection) {
+                try {
+                    storedChannel = doc.channels.add();
+                    storedChannel.name = "__FaceColorMatchSelection__";
+                    doc.selection.store(storedChannel);
+                } catch (_) { storedChannel = null; }
+                try { doc.selection.deselect(); } catch (_) { }
+            }
+
+            // Create the empty Color Lookup adjustment layer.
+            var make = new ActionDescriptor(),
+                makeRef = new ActionReference(),
+                using = new ActionDescriptor();
+            makeRef.putClass(c2t("AdjL"));
+            make.putReference(c2t("null"), makeRef);
+            using.putClass(c2t("Type"), s2t("colorLookup"));
+            make.putObject(c2t("Usng"), c2t("AdjL"), using);
+            executeAction(c2t("Mk  "), make, DialogModes.NO);
+            layer = doc.activeLayer;
+
+            // Read both payloads byte-for-byte.
+            cubeFile.encoding = "BINARY";
+            if (!cubeFile.open("r")) throw new Error(str.lutReadFailed + "\n" + cubePath);
+            cubeOpened = true;
+            var cubeData = cubeFile.read();
+            cubeFile.close();
+            cubeOpened = false;
+
+            profileFile.encoding = "BINARY";
+            if (!profileFile.open("r")) throw new Error(str.lutProfileReadFailed + "\n" + profilePath);
+            profileOpened = true;
+            var profileData = profileFile.read();
+            profileFile.close();
+            profileOpened = false;
+
+            if (!profileData || profileData.length < 128)
+                throw new Error(str.lutProfileInvalid + "\n" + profilePath);
+
+            // This descriptor mirrors the successful manual CUBE load captured
+            // by ScriptingListener. The crucial difference from v0.2.4 is that
+            // "profile" is now a complete RGB->RGB device-link ICC generated by
+            // Python from the same residual LUT.
+            var setDesc = new ActionDescriptor(),
+                target = new ActionReference(),
+                lookup = new ActionDescriptor();
+
+            target.putEnumerated(c2t("AdjL"), c2t("Ordn"), c2t("Trgt"));
+            setDesc.putReference(c2t("null"), target);
+
+            lookup.putEnumerated(
+                s2t("lookupType"),
+                s2t("colorLookupType"),
+                s2t("3DLUT")
+            );
+            lookup.putString(c2t("Nm  "), cubeFile.fsName);
+            lookup.putData(s2t("profile"), profileData);
+            lookup.putEnumerated(
+                s2t("LUTFormat"),
+                s2t("LUTFormatType"),
+                s2t("LUTFormatCUBE")
+            );
+            lookup.putData(s2t("LUT3DFileData"), cubeData);
+            lookup.putString(s2t("LUT3DFileName"), cubeFile.fsName);
+
+            setDesc.putObject(c2t("T   "), s2t("colorLookup"), lookup);
+            executeAction(c2t("setd"), setDesc, DialogModes.NO);
+
+            try { doc.activeLayer.name = name; } catch (_) { }
+            try {
+                var op = Number(opacity);
+                if (isNaN(op)) op = 100;
+                doc.activeLayer.opacity = Math.max(0, Math.min(100, op));
+            } catch (_) { }
+            if (parentGroup) {
+                try { doc.activeLayer.move(parentGroup, ElementPlacement.INSIDE); } catch (_) { }
+            }
+
+            // Both payloads are embedded into the Color Lookup descriptor.
+            // Once Photoshop accepts the layer, the temporary files are no longer
+            // needed and can be removed immediately.
+            try { if (cubeFile.exists) cubeFile.remove(); } catch (_) { }
+            try { if (profileFile.exists) profileFile.remove(); } catch (_) { }
+            return {
+                imported: true,
+                method: "embedded device-link ICC"
+            };
+        } catch (e) {
+            if (cubeOpened) try { cubeFile.close(); } catch (_) { }
+            if (profileOpened) try { profileFile.close(); } catch (_) { }
+            if (layer) try { layer.remove(); } catch (_) { }
+            throw e;
         } finally {
             if (storedChannel) {
                 try { doc.selection.load(storedChannel, SelectionType.REPLACE); } catch (_) { }
@@ -441,7 +742,9 @@ app.bringToFront();
         return d;
     }
 
-    // -------------------- Python bridge --------------------
+    // ---
+    // ЛОКАЛЬНЫЙ PYTHON API
+    // ---
     function BridgeApi() {
         var self = this;
         this.initialize = function () {
@@ -495,8 +798,7 @@ app.bringToFront();
                 preset_folder: data.presetFolder,
                 preset_id: data.selectedPresetId,
                 mode: data.mode,
-                max_points: data.maxPoints,
-                color_tolerance: data.colorTolerance,
+                minimum_gain: Number(data.minimumGain),
                 use_master: !!data.useMaster
             }, 45000);
         };
@@ -538,7 +840,7 @@ app.bringToFront();
             if (py.indexOf("3.11.") !== 0 && py.indexOf("3.14.") !== 0) throw new Error(str.unsupportedPython + " " + py);
         }
         function writeLaunchConfig() {
-            writeTextFile(new File(Folder.temp.fsName + "/" + APP.launchFile), jsonStringify({ python_version: cfg.data.pythonVersion || "auto", time: (new Date()).getTime() }));
+            writeTextFile(new File(Folder.temp.fsName + "/" + APP.launchFile), jsonStringify({ python_version: "auto", time: (new Date()).getTime() }));
         }
         function clearStartupStatus() {
             var f = new File(Folder.temp.fsName + "/" + APP.startupFile);
@@ -570,194 +872,405 @@ app.bringToFront();
     }
 
     // -------------------- Actions --------------------
+    // ---
+    // PHOTOSHOP ACTIONS
+    // Чтение идёт из app.playbackParameters; запись — через специальную
+    // глобальную playbackParameters. DescriptorCodec совпадает по принципу
+    // с img2img helper и убирает ручное кодирование каждого типа.
+    // ---
     function ActionRuntime() {
+        function actionData() {
+            var gain = Number(cfg.data.minimumGain),
+                strength = Number(cfg.data.strength);
+
+            if (isNaN(gain)) gain = 0.1;
+            if (isNaN(strength)) strength = 100;
+
+            return {
+                actionDataVersion: 5,
+                selectedPresetId: String(cfg.data.selectedPresetId || ""),
+                mode: String(cfg.data.mode || "parametric"),
+                minimumGain: gain,
+                useMaster: !!cfg.data.useMaster,
+                strength: Math.round(strength),
+                layerName: String(cfg.data.layerName || "Face Color Match"),
+                skipNoFace: !!cfg.data.skipNoFace
+            };
+        }
+
         this.isPlayback = function () {
-            try { return !!(app.playbackParameters && app.playbackParameters.hasKey(s2t("actionDataVersion"))); }
-            catch (_) { return false; }
-        };
-        this.getRecordedSettingsMode = function () {
             try {
-                var d = app.playbackParameters, key = s2t("recordSettingsToAction");
-                return !!(d && d.hasKey(key) && d.getType(key) == DescValueType.BOOLEANTYPE && d.getBoolean(key));
-            } catch (_) { return false; }
+                var desc = app.playbackParameters,
+                    marker = s2t("actionDataVersion");
+                return !!(desc && desc.hasKey(marker));
+            } catch (_) {
+                return false;
+            }
         };
+
         this.hasInterfaceArgument = function () {
-            var args = [], i, value;
-            try { if ($.arguments) for (i = 0; i < $.arguments.length; i++) args.push($.arguments[i]); } catch (_) { }
-            for (i = 0; i < args.length; i++) {
-                value = String(args[i]).toLowerCase();
-                if (value == "ui" || value == "dialog" || value == "--ui" || value == "--dialog" || value == "/ui" || value == "/dialog") return true;
+            var values = [], i, value;
+
+            try {
+                if ($.arguments && $.arguments.length)
+                    for (i = 0; i < $.arguments.length; i++)
+                        values.push($.arguments[i]);
+            } catch (_) { }
+
+            for (i = 0; i < values.length; i++) {
+                value = String(values[i]).toLowerCase();
+                if (
+                    value == "dialog" || value == "ui" ||
+                    value == "--dialog" || value == "--ui" ||
+                    value == "/dialog" || value == "/ui"
+                ) return true;
             }
             return false;
         };
+
         this.loadFromAction = function () {
-            var d = app.playbackParameters, map = [
-                    ["selectedPresetId", DescValueType.STRINGTYPE],
-                    ["mode", DescValueType.STRINGTYPE],
-                    ["maxPoints", DescValueType.INTEGERTYPE],
-                    ["colorTolerance", DescValueType.DOUBLETYPE],
-                    ["useMaster", DescValueType.BOOLEANTYPE],
-                    ["strength", DescValueType.INTEGERTYPE],
-                    ["layerName", DescValueType.STRINGTYPE],
-                    ["skipNoFace", DescValueType.BOOLEANTYPE],
-                    ["recordSettingsToAction", DescValueType.BOOLEANTYPE]
-                ], i, key, type;
-            for (i = 0; i < map.length; i++) {
-                key = s2t(map[i][0]); type = map[i][1];
-                if (!d.hasKey(key)) continue;
-                try {
-                    if (type == DescValueType.STRINGTYPE) cfg.data[map[i][0]] = d.getString(key);
-                    else if (type == DescValueType.INTEGERTYPE) cfg.data[map[i][0]] = d.getInteger(key);
-                    else if (type == DescValueType.DOUBLETYPE) cfg.data[map[i][0]] = d.getDouble(key);
-                    else if (type == DescValueType.BOOLEANTYPE) cfg.data[map[i][0]] = d.getBoolean(key);
-                } catch (_) { }
+            var values = {};
+
+            try {
+                descriptorCodec.readInto(values, app.playbackParameters);
+            } catch (_) {
+                return;
             }
+
+            if (values.selectedPresetId !== undefined)
+                cfg.data.selectedPresetId = String(values.selectedPresetId || "");
+            if (values.mode !== undefined)
+                cfg.data.mode = String(values.mode || "parametric");
+            if (values.minimumGain !== undefined)
+                cfg.data.minimumGain = Number(values.minimumGain);
+            if (values.useMaster !== undefined)
+                cfg.data.useMaster = !!values.useMaster;
+            if (values.strength !== undefined)
+                cfg.data.strength = Number(values.strength);
+            if (values.layerName !== undefined)
+                cfg.data.layerName = String(values.layerName || "Face Color Match");
+            if (values.skipNoFace !== undefined)
+                cfg.data.skipNoFace = !!values.skipNoFace;
         };
+
         this.saveToAction = function () {
-            var d = new ActionDescriptor();
-            d.putInteger(s2t("actionDataVersion"), 2);
-            d.putBoolean(s2t("recordSettingsToAction"), !!cfg.data.recordSettingsToAction);
-            if (cfg.data.recordSettingsToAction) {
-                d.putString(s2t("selectedPresetId"), String(cfg.data.selectedPresetId || ""));
-                d.putString(s2t("mode"), String(cfg.data.mode || "precise"));
-                d.putInteger(s2t("maxPoints"), parseInt(cfg.data.maxPoints, 10) || 0);
-                var actionTolerance = Number(cfg.data.colorTolerance); if (isNaN(actionTolerance)) actionTolerance = 2.0; d.putDouble(s2t("colorTolerance"), actionTolerance);
-                d.putBoolean(s2t("useMaster"), !!cfg.data.useMaster);
-                var actionStrength = Number(cfg.data.strength); if (isNaN(actionStrength)) actionStrength = 100; d.putInteger(s2t("strength"), Math.round(actionStrength));
-                d.putString(s2t("layerName"), String(cfg.data.layerName || "Face Color Match"));
-                d.putBoolean(s2t("skipNoFace"), !!cfg.data.skipNoFace);
-            }
-            // Use the documented Photoshop Application property first.
-            // Older ExtendScript builds also expose playbackParameters globally.
-            var assigned = false;
-            try { app.playbackParameters = d; assigned = true; } catch (_) { }
-            if (!assigned) { try { playbackParameters = d; assigned = true; } catch (_) { } }
-            if (!assigned) throw new Error(str.actionRecordError);
+            // Photoshop Action recorder harvests this bare global variable.
+            playbackParameters = descriptorCodec.toDescriptor(actionData(), true);
         };
     }
 
-    // -------------------- Settings --------------------
+    function DescriptorCodec() {
+        function readDescriptor(target, desc) {
+            for (var i = 0; i < desc.count; i++) {
+                var key = desc.getKey(i),
+                    name = t2s(key),
+                    type = desc.getType(key);
+
+                if (type == DescValueType.BOOLEANTYPE)
+                    target[name] = desc.getBoolean(key);
+                else if (type == DescValueType.STRINGTYPE)
+                    target[name] = desc.getString(key);
+                else if (type == DescValueType.INTEGERTYPE)
+                    target[name] = desc.getInteger(key);
+                else if (type == DescValueType.LARGEINTEGERTYPE)
+                    target[name] = desc.getLargeInteger(key);
+                else if (type == DescValueType.DOUBLETYPE)
+                    target[name] = desc.getDouble(key);
+                else if (type == DescValueType.OBJECTTYPE) {
+                    target[name] = {};
+                    readDescriptor(target[name], desc.getObjectValue(key));
+                } else if (type == DescValueType.LISTTYPE) {
+                    target[name] = readList(desc.getList(key));
+                }
+            }
+            return target;
+        }
+
+        function readList(list) {
+            var result = [];
+
+            for (var i = 0; i < list.count; i++) {
+                var type = list.getType(i);
+
+                if (type == DescValueType.BOOLEANTYPE)
+                    result.push(list.getBoolean(i));
+                else if (type == DescValueType.STRINGTYPE)
+                    result.push(list.getString(i));
+                else if (type == DescValueType.INTEGERTYPE)
+                    result.push(list.getInteger(i));
+                else if (type == DescValueType.LARGEINTEGERTYPE)
+                    result.push(list.getLargeInteger(i));
+                else if (type == DescValueType.DOUBLETYPE)
+                    result.push(list.getDouble(i));
+                else if (type == DescValueType.OBJECTTYPE)
+                    result.push(readDescriptor({}, list.getObjectValue(i)));
+                else if (type == DescValueType.LISTTYPE)
+                    result.push(readList(list.getList(i)));
+            }
+            return result;
+        }
+
+        function writeDescriptor(object, integerNumbers) {
+            var desc = new ActionDescriptor();
+
+            for (var name in object) if (object.hasOwnProperty(name)) {
+                var value = object[name],
+                    key;
+
+                if (
+                    value === null || value === undefined ||
+                    typeof value == "function"
+                ) continue;
+
+                try {
+                    key = s2t(String(name));
+                } catch (_) {
+                    continue;
+                }
+
+                if (typeof value == "boolean")
+                    desc.putBoolean(key, value);
+                else if (typeof value == "string")
+                    desc.putString(key, value);
+                else if (typeof value == "number") {
+                    if (
+                        integerNumbers &&
+                        value == Math.round(value) &&
+                        value >= -2147483648 &&
+                        value <= 2147483647
+                    ) desc.putInteger(key, value);
+                    else desc.putDouble(key, value);
+                } else if (value instanceof Array) {
+                    desc.putList(key, writeList(value, integerNumbers));
+                } else if (typeof value == "object") {
+                    desc.putObject(
+                        key,
+                        s2t("object"),
+                        writeDescriptor(value, integerNumbers)
+                    );
+                }
+            }
+            return desc;
+        }
+
+        function writeList(array, integerNumbers) {
+            var list = new ActionList();
+
+            for (var i = 0; i < array.length; i++) {
+                var value = array[i];
+
+                if (
+                    value === null || value === undefined ||
+                    typeof value == "function"
+                ) continue;
+
+                if (typeof value == "boolean")
+                    list.putBoolean(value);
+                else if (typeof value == "string")
+                    list.putString(value);
+                else if (typeof value == "number") {
+                    if (
+                        integerNumbers &&
+                        value == Math.round(value) &&
+                        value >= -2147483648 &&
+                        value <= 2147483647
+                    ) list.putInteger(value);
+                    else list.putDouble(value);
+                } else if (value instanceof Array) {
+                    list.putList(writeList(value, integerNumbers));
+                } else if (typeof value == "object") {
+                    list.putObject(
+                        s2t("object"),
+                        writeDescriptor(value, integerNumbers)
+                    );
+                }
+            }
+            return list;
+        }
+
+        this.readInto = function (target, desc) {
+            return readDescriptor(target || {}, desc);
+        };
+
+        this.toDescriptor = function (object, integerNumbers) {
+            return writeDescriptor(object || {}, !!integerNumbers);
+        };
+    }
+
+    // ---
+    // КОНФИГУРАЦИЯ
+    // Глобальные настройки хранятся отдельно от снимка параметров Action.
+    // ---
+
+    function normalizeFolderPath(value) {
+        var text = String(value || "");
+        if (!text) return text;
+        try { return (new Folder(text)).fsName; }
+        catch (_) { return text; }
+    }
+
     function Config() {
         this.data = defaults();
+
         this.load = function () {
-            var file = settingsFile(), backup = new File(file.fsName + ".bak"), loaded = null, key;
+            var file = settingsFile(),
+                backup = new File(file.fsName + ".bak"),
+                loaded = null,
+                key;
+
             if (file.exists) {
-                try { loaded = jsonParse(readTextFile(file)); } catch (_) { loaded = null; }
+                try { loaded = jsonParse(readTextFile(file)); }
+                catch (_) { loaded = null; }
             }
             if ((!loaded || typeof loaded != "object") && backup.exists) {
-                try { loaded = jsonParse(readTextFile(backup)); } catch (_) { loaded = null; }
+                try { loaded = jsonParse(readTextFile(backup)); }
+                catch (_) { loaded = null; }
             }
             if (!loaded || typeof loaded != "object") return;
-            var oldSettingsVersion = Number(loaded.settingsVersion || 0);
-            for (key in loaded) if (loaded.hasOwnProperty(key) && this.data.hasOwnProperty(key)) this.data[key] = loaded[key];
-            if (oldSettingsVersion < 2) {
-                this.data.colorTolerance = 2.0;
+
+            for (key in loaded) {
+                if (
+                    loaded.hasOwnProperty(key)
+                    && this.data.hasOwnProperty(key)
+                ) this.data[key] = loaded[key];
             }
-            if (oldSettingsVersion < 3) {
-                // v0.1.6 restores the composite curve as the dedicated exposure
-                // correction stage. It no longer performs chromatic matching.
-                this.data.useMaster = true;
-            }
-            this.data.settingsVersion = 3;
+
+            this.data.settingsVersion = 5;
             normalize(this.data);
         };
+
         this.save = function () {
             normalize(this.data);
-            var folder = settingsFolder(), file = settingsFile(), backup = new File(file.fsName + ".bak");
-            if (!ensureFolder(folder)) throw new Error(str.settingsWriteError + "\n" + folder.fsName);
+            var folder = settingsFolder(),
+                file = settingsFile(),
+                backup = new File(file.fsName + ".bak");
+
+            if (!ensureFolder(folder))
+                throw new Error(str.settingsWriteError + "\n" + folder.fsName);
+
             if (file.exists) {
                 try { if (backup.exists) backup.remove(); } catch (_) { }
                 try { file.copy(backup.fsName); } catch (_) { }
             }
             writeTextFile(file, jsonStringify(this.data));
         };
+
         this.ensurePresetFolder = function () {
             var folder = new Folder(this.data.presetFolder);
             ensureFolder(folder);
         };
+
         function defaults() {
             return {
-                presetFolder: Folder.myDocuments.fsName + "/Face Color Match Presets",
+                presetFolder: (new Folder(
+                    Folder.myDocuments.fsName + "/Face Color Match Presets"
+                )).fsName,
                 selectedPresetId: "",
-                pythonVersion: "auto",
                 previewSize: 1400,
-                settingsVersion: 3,
-                mode: "precise",
-                maxPoints: 0,
-                colorTolerance: 2.0,
+                settingsVersion: 5,
+                mode: "parametric",
+                minimumGain: 0.1,
                 useMaster: true,
                 strength: 100,
                 layerName: "Face Color Match",
-                recordSettingsToAction: true,
-                skipNoFace: false,
-                showDiagnostics: false
+                skipNoFace: false
             };
         }
+
         function normalize(d) {
-            d.presetFolder = String(d.presetFolder || Folder.myDocuments.fsName + "/Face Color Match Presets");
+            var defaultFolder = (new Folder(
+                    Folder.myDocuments.fsName + "/Face Color Match Presets"
+                )).fsName,
+                gain = Number(d.minimumGain),
+                strengthValue = Number(d.strength);
+
+            d.presetFolder = normalizeFolderPath(d.presetFolder || defaultFolder);
             d.selectedPresetId = String(d.selectedPresetId || "");
-            d.pythonVersion = d.pythonVersion == "3.11" ? "3.11" : (d.pythonVersion == "3.14" ? "3.14" : "auto");
-            d.previewSize = Math.max(640, Math.min(3000, parseInt(d.previewSize, 10) || 1400));
-            d.settingsVersion = 3;
-            d.mode = d.mode == "safe" ? "safe" : "precise";
-            d.maxPoints = (d.maxPoints == 2 || d.maxPoints == 3 || d.maxPoints == 4) ? Number(d.maxPoints) : 0;
-            var toleranceValue = Number(d.colorTolerance); if (isNaN(toleranceValue)) toleranceValue = 2.0; d.colorTolerance = Math.max(0, Math.min(10, toleranceValue));
+            d.previewSize = Math.max(
+                640,
+                Math.min(3000, parseInt(d.previewSize, 10) || 1400)
+            );
+            d.settingsVersion = 5;
+            d.mode = d.mode == "residual_lut" ? "residual_lut" : "parametric";
+
+            if (isNaN(gain)) gain = 0.1;
+            d.minimumGain = Math.max(
+                0,
+                Math.min(2, Math.round(gain * 10) / 10)
+            );
+
             d.useMaster = !!d.useMaster;
-            var strengthValue = Number(d.strength); if (isNaN(strengthValue)) strengthValue = 100; d.strength = Math.max(0, Math.min(100, Math.round(strengthValue)));
+
+            if (isNaN(strengthValue)) strengthValue = 100;
+            d.strength = Math.max(
+                0,
+                Math.min(100, Math.round(strengthValue))
+            );
+
             d.layerName = String(d.layerName || "Face Color Match");
-            d.recordSettingsToAction = d.recordSettingsToAction !== false;
             d.skipNoFace = !!d.skipNoFace;
-            d.showDiagnostics = !!d.showDiagnostics;
         }
-        function settingsFolder() { return new Folder(Folder.userData.fsName + "/" + APP.settingsFolder); }
-        function settingsFile() { return new File(settingsFolder().fsName + "/" + APP.settingsFile); }
+
+        function settingsFolder() {
+            return new Folder(Folder.userData.fsName + "/" + APP.settingsFolder);
+        }
+        function settingsFile() {
+            return new File(settingsFolder().fsName + "/" + APP.settingsFile);
+        }
     }
 
-    // -------------------- Localization --------------------
+    // ---
+    // ЛОКАЛИЗАЦИЯ
+    // ---
     function Locale() {
         var ru = String($.locale || app.locale || "").toLowerCase().indexOf("ru") === 0;
         var R = {
             noDocument: "Нет открытого документа.", preset: "Пресет", mode: "Режим", strength: "Сила",
-            modePrecise: "Точные кривые", modeSafe: "Безопасные кривые", apply: "ПРИМЕНИТЬ", cancel: "Отмена", ok: "OK",
+            modeParametric: "Smooth", modeResidualLut: "Smooth + Fine Tune", apply: "ПРИМЕНИТЬ", cancel: "Отмена", ok: "OK",
             settings: "Настройки", createPresetHelp: "Измерить текущий документ и создать новый пресет", updatePresetHelp: "Обновить выбранный пресет из текущего документа", deletePresetHelp: "Удалить выбранный пресет",
             presetNamePrompt: "Имя нового пресета:", updatePresetConfirm: "Обновить пресет «%s» по текущему документу?", deletePresetConfirm: "Удалить пресет «%s»?",
             progressMeasureReference: "Измерение образца...", progressPreparePreview: "Подготовка изображения...", progressMatch: "Выравнивание цвета...",
-            progressAnalyzeFace: "Анализ лица и подбор кривых...", progressCreateCurves: "Создание корректирующего слоя...",
-            presetFolder: "Папка пресетов", pythonVersion: "Системный Python", pythonAuto: "Авто", previewSize: "Размер анализа, px",
-            maxPoints: "Макс. точек на канал", auto: "Авто", colorTolerance: "Допуск совпадения ΔE", useMaster: "Корректировать яркость общей RGB-кривой", recordToAction: "Записывать рабочие настройки в Photoshop Action",
-            skipNoFace: "Пропускать изображение, если лицо не найдено", showDiagnostics: "Показывать ΔE после ручного запуска", layerName: "Имя слоя", general: "Общие настройки",
-            serverInfo: "Python-сервер запускается автоматически, использует системный Python 3.11/3.14 и выключается через 30 минут бездействия.", selectPresetFolder: "Выберите папку пресетов",
+            progressAnalyzeFace: "Анализ лица и построение плавной коррекции...", progressCreateCurves: "Создание корректирующих слоёв и LUT...",
+            presetFolder: "Папка пресетов", previewSize: "Размер анализа, px",
+            minimumGain: "Мин. улучшение ΔE", useMaster: "Корректировать тон по светлоте",
+            skipNoFace: "Пропускать изображение, если лицо не найдено", layerName: "Имя слоя", general: "Общие настройки",
+            serverInfo: "Python-сервер запускается автоматически и выключается через 30 минут бездействия. Версия Python выбирается автоматически из установленных поддерживаемых вариантов.", selectPresetFolder: "Выберите папку пресетов",
             folderRequired: "Укажите папку пресетов.", noPresetSelected: "Не выбран пресет образца.", invalidCurveResult: "Python вернул некорректный результат кривых.",
             pythonMissing: "Не найден face-color-api.pyw/.py рядом со скриптом или в подпапке lib.", pythonStartFailed: "Не удалось запустить Python-сервер.",
             pythonTimeout: "Python-сервер не запустился за отведённое время.", pythonConnection: "Нет соединения с локальным Python API.", listenerError: "Не удалось открыть локальный порт ответа: ",
             apiTimeout: "Истекло время ожидания ответа Python API.", apiError: "Ошибка Python API.", protocolMismatch: "Версия протокола Python API не совпадает с JSX.", serverVersionMismatch: "Версия Python-сервера не совпадает с JSX:", unsupportedPython: "Python API запущен в неподдерживаемой версии Python:",
-            logFile: "Лог", settingsWriteError: "Не удалось создать папку настроек.", actionRecordError: "Photoshop не принял параметры шага Action.", diagnostics: "Диагностика подбора", improvement: "Улучшение", correspondences: "Контрольных точек", curvePoints: "Внутренних точек", tolerance: "Допуск", lumaError: "Ошибка яркости", maxBend: "Макс. изгиб"
+            logFile: "Лог", settingsWriteError: "Не удалось создать папку настроек.", actionRecordError: "Photoshop не принял параметры шага Action.", diagnostics: "Диагностика подбора", improvement: "Улучшение", correspondences: "Контрольных точек", curvePoints: "Внутренних точек", tolerance: "Допуск", lumaError: "Ошибка яркости", maxBend: "Макс. изгиб", lutFileMissing: "Не найден временный residual LUT.", lutProfileMissing: "Не найден временный ICC profile для residual LUT.", lutReadFailed: "Не удалось прочитать residual LUT.", lutProfileReadFailed: "Не удалось прочитать ICC profile residual LUT.", lutProfileInvalid: "ICC profile residual LUT повреждён или слишком мал.", lutProfileSavedAt: "ICC profile сохранён:", lutImportFailed: "Photoshop не смог автоматически загрузить residual LUT. Файл оставлен на диске:", lutLoaded: "Residual LUT загружен автоматически", lutLoadFailed: "Residual LUT был создан, но Photoshop не смог его загрузить.", lutSavedAt: "Файл LUT сохранён:", lutNotCreated: "Residual LUT не создавался", lutReasonThreshold: "после Parametric Match остаточная ошибка уже ниже порога", lutReasonGain: "расчётный LUT даёт слишком маленькое улучшение", lutReasonModel: "недостаточно надёжных данных для residual LUT", lutReasonUnknown: "нет подходящей residual-коррекции", lutThreshold: "порог", lutPredictedGain: "расчётное улучшение ΔE", lutForcedDebug: "ОТЛАДКА: LUT создан принудительно независимо от ожидаемого выигрыша ΔE.", lutExactNoProfileFailed: "Тест точного ScriptingListener-дескриптора без поля profile завершился ошибкой."
         }, E = {
             noDocument: "No document is open.", preset: "Preset", mode: "Mode", strength: "Strength",
-            modePrecise: "Precise curves", modeSafe: "Safe curves", apply: "APPLY", cancel: "Cancel", ok: "OK",
+            modeParametric: "Smooth", modeResidualLut: "Smooth + Fine Tune", apply: "APPLY", cancel: "Cancel", ok: "OK",
             settings: "Settings", createPresetHelp: "Measure the current document and create a new preset", updatePresetHelp: "Update the selected preset from the current document", deletePresetHelp: "Delete the selected preset",
             presetNamePrompt: "New preset name:", updatePresetConfirm: "Update preset “%s” from the current document?", deletePresetConfirm: "Delete preset “%s”?",
             progressMeasureReference: "Measuring reference...", progressPreparePreview: "Preparing image...", progressMatch: "Matching color...",
-            progressAnalyzeFace: "Analyzing face and fitting curves...", progressCreateCurves: "Creating adjustment layer...",
-            presetFolder: "Preset folder", pythonVersion: "System Python", pythonAuto: "Auto", previewSize: "Analysis size, px",
-            maxPoints: "Max points per channel", auto: "Auto", colorTolerance: "Match tolerance ΔE", useMaster: "Correct exposure with composite RGB curve", recordToAction: "Record working settings into Photoshop Action",
-            skipNoFace: "Skip image when no face is found", showDiagnostics: "Show ΔE after manual run", layerName: "Layer name", general: "General settings",
-            serverInfo: "The Python server starts automatically, uses system Python 3.11/3.14, and exits after 30 minutes of inactivity.", selectPresetFolder: "Select preset folder",
+            progressAnalyzeFace: "Analyzing face and fitting smooth match...", progressCreateCurves: "Creating adjustment layers and LUTs...",
+            presetFolder: "Preset folder", previewSize: "Analysis size, px",
+            minimumGain: "Min. ΔE improvement", useMaster: "Correct tone from lightness",
+            skipNoFace: "Skip image when no face is found", layerName: "Layer name", general: "General settings",
+            serverInfo: "The Python server starts automatically and exits after 30 minutes of inactivity. A supported installed Python is selected automatically.", selectPresetFolder: "Select preset folder",
             folderRequired: "Select a preset folder.", noPresetSelected: "No reference preset is selected.", invalidCurveResult: "Python returned an invalid curve result.",
             pythonMissing: "face-color-api.pyw/.py was not found next to the script or in the lib subfolder.", pythonStartFailed: "Could not start the Python server.",
             pythonTimeout: "The Python server did not start in time.", pythonConnection: "Could not connect to the local Python API.", listenerError: "Could not open local reply port: ",
             apiTimeout: "Timed out waiting for the Python API.", apiError: "Python API error.", protocolMismatch: "Python API protocol does not match JSX.", serverVersionMismatch: "Python server version does not match JSX:", unsupportedPython: "Python API is running under an unsupported Python version:",
-            logFile: "Log", settingsWriteError: "Could not create the settings folder.", actionRecordError: "Photoshop did not accept the Action step parameters.", diagnostics: "Fit diagnostics", improvement: "Improvement", correspondences: "Control points", curvePoints: "Internal points", tolerance: "Tolerance", lumaError: "Luma error", maxBend: "Max bend"
+            logFile: "Log", settingsWriteError: "Could not create the settings folder.", actionRecordError: "Photoshop did not accept the Action step parameters.", diagnostics: "Fit diagnostics", improvement: "Improvement", correspondences: "Control points", curvePoints: "Internal points", tolerance: "Tolerance", lumaError: "Luma error", maxBend: "Max bend", lutFileMissing: "The temporary residual LUT file was not found.", lutProfileMissing: "The temporary residual LUT ICC profile was not found.", lutReadFailed: "Could not read the residual LUT.", lutProfileReadFailed: "Could not read the residual LUT ICC profile.", lutProfileInvalid: "The residual LUT ICC profile is invalid or truncated.", lutProfileSavedAt: "ICC profile saved at:", lutImportFailed: "Photoshop could not automatically load the residual LUT. The LUT file was left on disk:", lutLoaded: "Residual LUT loaded automatically", lutLoadFailed: "The residual LUT was generated, but Photoshop could not load it.", lutSavedAt: "LUT file saved at:", lutNotCreated: "Residual LUT was not generated", lutReasonThreshold: "the residual error after Parametric Match is already below the threshold", lutReasonGain: "the predicted LUT improvement is too small", lutReasonModel: "there is not enough reliable residual data to build a LUT", lutReasonUnknown: "no suitable residual correction was found", lutThreshold: "threshold", lutPredictedGain: "predicted ΔE improvement", lutForcedDebug: "DEBUG: LUT was generated forcibly regardless of the predicted ΔE gain.", lutExactNoProfileFailed: "The exact ScriptingListener descriptor test without the profile field failed."
         }, key, source = ru ? R : E;
         for (key in source) if (source.hasOwnProperty(key)) this[key] = source[key];
     }
 
-    // -------------------- Helpers --------------------
+    // ---
+    // ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+    // ---
     function documentSummary() {
         try {
             var d = app.activeDocument;
-            return d.width.as("px") + "×" + d.height.as("px") + " px  •  " + d.bitsPerChannel.toString().replace("BitsPerChannelType.", "") + "  •  " + d.name;
-        } catch (_) { return app.activeDocument.name; }
+            return d.width.as("px") + "×" + d.height.as("px") +
+                " px  •  " + d.name;
+        } catch (_) {
+            return app.activeDocument.name;
+        }
     }
     function stripExtension(name) { return String(name || "").replace(/\.[^.]+$/, ""); }
     function trim(value) { return String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, ""); }
