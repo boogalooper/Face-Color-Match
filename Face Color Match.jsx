@@ -35,7 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.12.1",
+            version: "0.13.1",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -1238,7 +1238,7 @@ function faceColorMatchApplyHistory() {
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 9,
+                actionDataVersion: 11,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
                 strength: Math.round(strength),
                 lightnessBalance: Math.round(Number(cfg.data.lightnessBalance) || 0),
@@ -1461,7 +1461,7 @@ function faceColorMatchApplyHistory() {
     }
 
     function Config() {
-        var SETTINGS_VERSION = 10;
+        var SETTINGS_VERSION = 12;
         this.data = defaults();
 
         this.load = function () {
@@ -1529,6 +1529,7 @@ function faceColorMatchApplyHistory() {
                 strength: 100,
                 lightnessBalance: 0,
                 protectionBias: 0,
+                faceSelectionMode: "main",
                 layerName: "Face Color Match",
                 skipNoFace: false
             };
@@ -1609,7 +1610,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Измерить текущий документ и создать новый пресет",
                 strengthHelp: "Общая сила применения найденной коррекции. 100% — полный эффект, меньшие значения ослабляют все созданные корректирующие слои как одну группу.",
                 lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
-                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. В сторону «Точность» алгоритм ослабляет часть защитных порогов и может проверить Skin Match до 120% расчётной силы, но оставляет только реально улучшающий и не катастрофический вариант. В сторону «Защита» максимальная сила Skin Match плавно снижается до 60%, усиливается защита фона и ограничивается внутренняя доводка.",
+                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto и полностью сохраняет обычную логику. Чем дальше в сторону «Точность», тем сильнее алгоритм стремится к минимальному ΔE: плавно ослабляются cross-validation и защита окружающих цветов, расширяется внутренняя доводка и максимальная сила Skin Match растёт до 150%. Крайнее положение «Точность» соответствует прежнему режиму «Агрессивная коррекция». В сторону «Защита» максимальная сила Skin Match снижается до 60%, а проверки становятся строже.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Измерить текущий документ: добавить его к усреднённому эталону или полностью заменить эталон",
                 presetNamePrompt: "Имя нового пресета:",
@@ -1683,7 +1684,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Measure the current document and create a new preset",
                 strengthHelp: "Overall strength of the fitted correction. 100% keeps the full effect; lower values reduce the opacity of the created adjustment group.",
                 lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
-                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Toward Accuracy some safety thresholds are relaxed and the script may test Skin Match up to 120% of the fitted strength, keeping it only when measured skin ΔE genuinely improves without catastrophic spill. Toward Safety the maximum Skin Match strength falls progressively to 60%, background protection becomes stricter, and internal refinement is limited.",
+                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto and preserves the normal behavior exactly. Moving toward Accuracy progressively prioritizes minimum ΔE: cross-validation and surrounding-colour protection are relaxed, internal refinement gets more freedom, and maximum Skin Match strength rises to 150%. The far Accuracy endpoint matches the former Aggressive correction mode. Moving toward Safety reduces maximum Skin Match strength to 60% and makes validation stricter.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Measure the current document: add it to the averaged reference or replace the reference completely",
                 presetNamePrompt: "New preset name:",

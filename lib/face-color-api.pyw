@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.12.1"
+VERSION = "0.13.1"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -1651,7 +1651,10 @@ def _wb_stage_is_safe(
     protection_bias: float = 0.0,
 ) -> Tuple[bool, Dict[str, float]]:
     stats = _stage_stats(before_rows, after_rows)
-    protection = _protection_profile(protection_bias, minimum_gain)
+    protection = _protection_profile(
+        protection_bias,
+        minimum_gain,
+    )
     if stats["gain"] + 1e-9 < max(0.0, float(minimum_gain)):
         return False, stats
     if stats["nonworse_fraction"] < protection["wb_nonworse"] or stats["p75_worsening"] > protection["wb_p75"]:
@@ -3268,11 +3271,15 @@ def _choose_smooth_skin_strength(
     """Choose strength using the actual exported LUT, not the continuous model."""
     baseline = float(_rows_delta_e_identity(rows))
     baseline_chroma = _chroma_stage_stats(rows, rows)
-    protection = _protection_profile(protection_bias, minimum_gain)
+    protection = _protection_profile(
+        protection_bias,
+        minimum_gain,
+    )
+    accuracy_mix = float(protection["accuracy_mix"])
     max_strength = float(np.clip(
         protection["max_skin_strength"],
         0.60,
-        1.20,
+        1.50,
     ))
     strengths = tuple(
         round(v / 10.0, 2)
@@ -3314,6 +3321,7 @@ def _choose_smooth_skin_strength(
         catastrophic = _collateral_is_catastrophic(
             collateral,
             fine_tune=False,
+            protection_bias=protection_bias,
         )
 
         valid = bool(
@@ -3379,6 +3387,15 @@ def _choose_smooth_skin_strength(
         }
 
     best = min(valid_candidates, key=lambda item: item["score"])
+    score_span = max(
+        float(item["score"])
+        for item in valid_candidates
+    ) - float(best["score"])
+    near_best_score_extra = (
+        (1.0 - accuracy_mix)
+        * float(protection["near_best_score_extra"])
+        + accuracy_mix * (score_span + 1e-9)
+    )
     best_gain = max(
         float(item["stats"]["gain"])
         for item in valid_candidates
@@ -3399,21 +3416,24 @@ def _choose_smooth_skin_strength(
             and (
                 not chroma_is_material
                 or float(item["chroma"]["gain"])
-                    >= best_chroma_gain * 0.94
+                    >= best_chroma_gain
+                    * protection["near_best_chroma_ratio"]
             )
             and float(item["score"])
             <= float(best["score"])
-            + protection["near_best_score_extra"]
+            + near_best_score_extra
         )
     ]
 
     if protection["bias"] < -1e-9:
-        # Accuracy: among near-optimal safe candidates prefer the one with the
-        # smallest actual skin ΔE; if effectively tied, keep the stronger one.
+        # Accuracy: the eligible set widens continuously as the slider moves
+        # left. At -100 it contains every otherwise-valid candidate, reproducing
+        # the former Aggressive correction selection rule.
         chosen = min(
             near_best or valid_candidates,
             key=lambda item: (
                 float(item["stats"]["after"]),
+                float(item["chroma"]["after"]),
                 -float(item["strength"]),
             ),
         )
@@ -3769,71 +3789,137 @@ def _tone_weight_scale(q_value: float, lightness_balance: float) -> float:
     return float(np.clip(scale, 0.40, 2.10))
 
 
-def _protection_profile(protection_bias: float, minimum_gain: float) -> Dict[str, float]:
+def _accuracy_profile_mix(protection_bias: float) -> float:
+    """Smooth 0..1 transition from Auto to the former aggressive profile."""
     bias = _normalized_percent_bias(protection_bias)
-    # bias < 0 = Accuracy, bias > 0 = Safety.
-    #
-    # Auto (0) deliberately preserves v0.9.2 exactly. Away from Auto this
-    # control now changes the actual correction budget, not only pass/fail
-    # thresholds. That makes it useful on real borderline images.
+    accuracy = max(0.0, -bias)
+    # Smoothstep keeps Auto and the Accuracy endpoint stable while giving the
+    # middle of the slider a useful continuous transition.
+    return float(accuracy * accuracy * (3.0 - 2.0 * accuracy))
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return float(a + (b - a) * np.clip(float(t), 0.0, 1.0))
+
+
+def _protection_profile(
+    protection_bias: float,
+    minimum_gain: float,
+) -> Dict[str, float]:
+    bias = _normalized_percent_bias(protection_bias)
     base_cv_min = max(0.04, float(minimum_gain) * 0.50)
 
     accuracy = max(0.0, -bias)
     safety = max(0.0, bias)
+    accuracy_mix = _accuracy_profile_mix(protection_bias)
 
+    # Auto values are the established neutral profile. The left half of the
+    # slider interpolates smoothly from Auto to the former "Aggressive
+    # correction" profile. The right/Safety half is intentionally left exactly
+    # as before.
+    auto = {
+        "wb_nonworse": 0.70,
+        "wb_p75": 0.18,
+        "wb_cheek_worsening": 0.10,
+
+        "skin_nonworse": 0.58,
+        "skin_p75": 0.34,
+        "skin_cv_min": base_cv_min,
+        "score_cv_weight": 0.22,
+        "score_collateral_weight": 1.0,
+        "max_skin_strength": 1.0,
+
+        "near_best_gain_ratio": 0.98,
+        "near_best_score_extra": 0.06,
+        "near_best_chroma_ratio": 0.94,
+
+        "fine_nonworse": 0.60,
+        "fine_p75": 0.30,
+        "fine_min_gain": 0.02,
+        "max_refinement_strength": 1.0,
+
+        "final_nonworse": 0.58,
+        "final_p75": 0.34,
+    }
+
+    aggressive = {
+        "wb_nonworse": 0.52,
+        "wb_p75": 0.55,
+        "wb_cheek_worsening": 0.45,
+
+        "skin_nonworse": 0.38,
+        "skin_p75": 0.95,
+        "skin_cv_min": -0.35,
+        "score_cv_weight": 0.025,
+        "score_collateral_weight": 0.035,
+        "max_skin_strength": 1.50,
+
+        # At the endpoint every otherwise-valid candidate may compete on
+        # actual measured ΔE, just like the former checkbox mode.
+        "near_best_gain_ratio": 0.0,
+        "near_best_score_extra": 0.0,  # computed dynamically from score span
+        "near_best_chroma_ratio": 0.0,
+
+        "fine_nonworse": 0.40,
+        "fine_p75": 0.90,
+        "fine_min_gain": 0.001,
+        "max_refinement_strength": 1.0,
+
+        "final_nonworse": 0.38,
+        "final_p75": 0.95,
+    }
+
+    if accuracy > 0.0:
+        t = accuracy_mix
+        profile = {
+            key: _lerp(auto[key], aggressive[key], t)
+            for key in auto.keys()
+        }
+        profile.update({
+            "bias": bias,
+            "accuracy": accuracy,
+            "safety": 0.0,
+            "accuracy_mix": t,
+        })
+        return profile
+
+    # Auto and Safety preserve the previous profile exactly.
     return {
         "bias": bias,
+        "accuracy": 0.0,
+        "safety": safety,
+        "accuracy_mix": 0.0,
 
-        # Global WB gates.
-        "wb_nonworse": 0.70 - 0.07 * accuracy + 0.08 * safety,
-        "wb_p75": 0.18 + 0.10 * accuracy - 0.08 * safety,
-        "wb_cheek_worsening": 0.10 + 0.12 * accuracy - 0.06 * safety,
+        "wb_nonworse": 0.70 + 0.08 * safety,
+        "wb_p75": 0.18 - 0.08 * safety,
+        "wb_cheek_worsening": 0.10 - 0.06 * safety,
 
-        # Main Skin Match validity.
-        "skin_nonworse": 0.58 - 0.08 * accuracy + 0.10 * safety,
-        "skin_p75": 0.34 + 0.12 * accuracy - 0.10 * safety,
+        "skin_nonworse": 0.58 + 0.10 * safety,
+        "skin_p75": 0.34 - 0.10 * safety,
         "skin_cv_min": max(
             0.015,
-            base_cv_min * (1.0 - 0.55 * accuracy + 0.80 * safety),
+            base_cv_min * (1.0 + 0.80 * safety),
         ),
         "score_cv_weight": 0.22 * (
-            1.0 - 0.45 * accuracy + 0.90 * safety
+            1.0 + 0.90 * safety
         ),
-        "score_collateral_weight": (
-            1.0 - 0.50 * accuracy + 1.00 * safety
-        ),
+        "score_collateral_weight": 1.0 + 1.00 * safety,
+        "max_skin_strength": 1.0 - 0.40 * safety,
 
-        # Most important visible control: Accuracy may test a small,
-        # independently validated overdrive; Safety directly caps the maximum
-        # Skin Match strength. Auto stays exactly at 1.0.
-        "max_skin_strength": (
-            1.0 + 0.20 * accuracy - 0.40 * safety
-        ),
+        "near_best_gain_ratio": 0.98 - 0.10 * safety,
+        "near_best_score_extra": 0.06 + 0.16 * safety,
+        "near_best_chroma_ratio": 0.94,
 
-        # Candidate selection. At Auto: 0.98 / 0.06 exactly as before.
-        # Accuracy keeps only the strongest near-optimal candidates.
-        # Safety accepts a weaker candidate if it retains most of the gain.
-        "near_best_gain_ratio": (
-            0.98 + 0.02 * accuracy - 0.10 * safety
-        ),
-        "near_best_score_extra": (
-            0.06 - 0.04 * accuracy + 0.16 * safety
-        ),
-
-        # Internal chroma refinement.
-        "fine_nonworse": 0.60 - 0.08 * accuracy + 0.10 * safety,
-        "fine_p75": 0.30 + 0.12 * accuracy - 0.10 * safety,
+        "fine_nonworse": 0.60 + 0.10 * safety,
+        "fine_p75": 0.30 - 0.10 * safety,
         "fine_min_gain": max(
             0.003,
-            0.02 * (1.0 - 0.70 * accuracy + 2.00 * safety),
+            0.02 * (1.0 + 2.00 * safety),
         ),
-        "max_refinement_strength": (
-            1.0 - 0.55 * safety
-        ),
+        "max_refinement_strength": 1.0 - 0.55 * safety,
 
-        # Final one-layer recheck.
-        "final_nonworse": 0.58 - 0.08 * accuracy + 0.10 * safety,
-        "final_p75": 0.34 + 0.12 * accuracy - 0.10 * safety,
+        "final_nonworse": 0.58 + 0.10 * safety,
+        "final_p75": 0.34 - 0.10 * safety,
     }
 
 
@@ -4123,23 +4209,34 @@ def _lut_collateral_stats(
 def _collateral_is_catastrophic(
     stats: Dict[str, float],
     fine_tune: bool = False,
+    protection_bias: float = 0.0,
 ) -> bool:
-    """Collateral is a soft preference; only extreme spill is a hard veto."""
+    """Hard spill veto, smoothly relaxed toward the Accuracy endpoint."""
     if float(stats.get("count", 0.0)) < 10:
         return False
 
     affected = float(stats.get("affected_fraction", 0.0))
     p99 = float(stats.get("p99", 0.0))
     maximum = float(stats.get("max", 0.0))
+    t = _accuracy_profile_mix(protection_bias)
+
     if fine_tune:
-        return bool(
-            maximum > 5.0
-            or (affected > 0.10 and p99 > 2.6)
-        )
+        max_limit = _lerp(5.0, 11.0, t)
+        affected_limit = _lerp(0.10, 0.30, t)
+        p99_limit = _lerp(2.6, 6.0, t)
+    else:
+        max_limit = _lerp(6.5, 15.0, t)
+        affected_limit = _lerp(0.12, 0.38, t)
+        p99_limit = _lerp(3.2, 8.0, t)
+
     return bool(
-        maximum > 6.5
-        or (affected > 0.12 and p99 > 3.2)
+        maximum > max_limit
+        or (
+            affected > affected_limit
+            and p99 > p99_limit
+        )
     )
+
 
 
 def _collateral_penalty(
@@ -4302,7 +4399,10 @@ def fit_smooth_match(
     minimum_gain = float(np.clip(float(minimum_gain), 0.0, 2.0))
     lightness_balance = float(np.clip(float(lightness_balance), -100.0, 100.0))
     protection_bias = float(np.clip(float(protection_bias), -100.0, 100.0))
-    protection = _protection_profile(protection_bias, minimum_gain)
+    protection = _protection_profile(
+        protection_bias,
+        minimum_gain,
+    )
     before_original = float(_rows_delta_e_identity(rows))
 
     # --------------------------------------------------------
@@ -4459,7 +4559,8 @@ def fit_smooth_match(
             chosen_collateral = primary_collateral
             chosen_score = float(
                 primary_stats["after"]
-                + _collateral_penalty(
+                + protection["score_collateral_weight"]
+                * _collateral_penalty(
                     primary_collateral,
                     fine_tune=False,
                 )
@@ -4540,6 +4641,7 @@ def fit_smooth_match(
                     if _collateral_is_catastrophic(
                         collateral,
                         fine_tune=True,
+                        protection_bias=protection_bias,
                     ):
                         continue
                     if stats["nonworse_fraction"] < protection["fine_nonworse"]:
@@ -4550,7 +4652,12 @@ def fit_smooth_match(
                         continue
                     if (
                         chroma_stats["after"]
-                        > primary_chroma_stats["after"] + 0.15
+                        > primary_chroma_stats["after"]
+                        + _lerp(
+                            0.15,
+                            0.45,
+                            protection["accuracy_mix"],
+                        )
                     ):
                         continue
 
@@ -4584,6 +4691,7 @@ def fit_smooth_match(
                 and not _collateral_is_catastrophic(
                     chosen_collateral,
                     fine_tune=False,
+                    protection_bias=protection_bias,
                 )
             ):
                 skin_path = _write_cube(
@@ -4627,6 +4735,10 @@ def fit_smooth_match(
         "minimum_gain": round(float(minimum_gain), 3),
         "lightness_balance": round(float(lightness_balance), 1),
         "protection_bias": round(float(protection_bias), 1),
+        "accuracy_profile_mix": round(
+            float(protection["accuracy_mix"]),
+            4,
+        ),
         "protection_max_skin_strength": round(
             float(protection["max_skin_strength"]),
             3,
