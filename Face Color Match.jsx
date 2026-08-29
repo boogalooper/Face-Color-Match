@@ -35,7 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.12.0",
+            version: "0.12.1",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -310,15 +310,18 @@ function faceColorMatchApplyHistory() {
         }
         function repopulateFaceMode() {
             ddFaceMode.removeAll();
-            var itemMain = ddFaceMode.add("item", str.faceModeMain),
-                itemAverage = ddFaceMode.add("item", str.faceModeCentralAverage),
-                value = String(cfg.data.faceSelectionMode || "main");
-            itemMain.modeValue = "main";
-            itemAverage.modeValue = "central_average";
-            if (value == "central_average")
-                ddFaceMode.selection = itemAverage;
-            else
-                ddFaceMode.selection = itemMain;
+            ddFaceMode.add("item", str.faceModeMain);
+            ddFaceMode.add("item", str.faceModeCentralAverage);
+            ddFaceMode.selection =
+                String(cfg.data.faceSelectionMode || "main") == "central_average"
+                    ? 1
+                    : 0;
+        }
+
+        function selectedFaceMode() {
+            return ddFaceMode.selection && ddFaceMode.selection.index == 1
+                ? "central_average"
+                : "main";
         }
         function syncToneText(finalize) {
             var pointerActive = toneStepper.pointerActive,
@@ -352,8 +355,7 @@ function faceColorMatchApplyHistory() {
             if (item) cfg.data.selectedPresetId = String(item.id || "");
         };
         ddFaceMode.onChange = function () {
-            if (ddFaceMode.selection)
-                cfg.data.faceSelectionMode = String(ddFaceMode.selection.modeValue || "main");
+            cfg.data.faceSelectionMode = selectedFaceMode();
         };
         slStrength.onChanging = function () { tStrengthValue.text = String(Math.round(slStrength.value)) + "%"; };
         slStrength.onChange = function () { cfg.data.strength = Math.round(slStrength.value); tStrengthValue.text = String(cfg.data.strength) + "%"; };
@@ -433,8 +435,7 @@ function faceColorMatchApplyHistory() {
             if (!item) return;
             cfg.data.selectedPresetId = String(item.id || "");
             cfg.data.strength = Math.round(slStrength.value);
-            if (ddFaceMode.selection)
-                cfg.data.faceSelectionMode = String(ddFaceMode.selection.modeValue || "main");
+            cfg.data.faceSelectionMode = selectedFaceMode();
             syncToneText(true);
             syncProtectionText(true);
             w.close(1);
@@ -1595,6 +1596,9 @@ function faceColorMatchApplyHistory() {
                 noDocument: "Нет открытого документа.",
                 preset: "Пресет",
                 faceSelectionMode: "Лицо",
+                faceModeMain: "Основное лицо",
+                faceModeCentralAverage: "Центральные лица (среднее)",
+                faceSelectionModeHelp: "Основное лицо — текущая логика выбора главного лица по размеру и близости к центру. Центральные лица (среднее) — до 3 подходящих лиц ближе к центру кадра с усреднением измерений кожи.",
                 strength: "Сила",
                 lightnessBalance: "Тени / света",
                 protectionBias: "Точность / защита",
@@ -1666,6 +1670,9 @@ function faceColorMatchApplyHistory() {
                 noDocument: "No document is open.",
                 preset: "Preset",
                 faceSelectionMode: "Face",
+                faceModeMain: "Main face",
+                faceModeCentralAverage: "Central faces (average)",
+                faceSelectionModeHelp: "Main face keeps the current primary-face logic based on size and proximity to center. Central faces (average) uses up to 3 suitable faces nearest the frame center and averages their skin measurements.",
                 strength: "Strength",
                 lightnessBalance: "Shadows / highlights",
                 protectionBias: "Accuracy / safety",
