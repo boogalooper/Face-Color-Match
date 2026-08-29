@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.15.7"
+VERSION = "0.15.10"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -6752,6 +6752,53 @@ def resolve_preset(folder: str, preset_id: str, preset_path: str = "") -> Tuple[
     raise ApiError(f"Preset was not found: {preset_id}", "PRESET_NOT_FOUND")
 
 
+def delete_preset(message: Dict[str, Any]) -> Dict[str, Any]:
+    folder_text = str(message.get("preset_folder") or "").strip()
+    preset_id = str(message.get("preset_id") or "").strip()
+    preset_path = str(message.get("preset_path") or "").strip()
+    if not folder_text or not preset_id:
+        raise ApiError(
+            "Preset folder and preset id are required.",
+            "INVALID_ARGUMENT",
+        )
+
+    root = Path(folder_text).expanduser().resolve()
+    path, data = resolve_preset(folder_text, preset_id, preset_path)
+    resolved = path.expanduser().resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ApiError(
+            "Preset file is outside the configured preset folder.",
+            "PRESET_DELETE_FORBIDDEN",
+        ) from exc
+
+    if resolved.suffix.lower() != ".json":
+        raise ApiError(
+            "Only Face Color Match JSON presets can be deleted.",
+            "PRESET_DELETE_FORBIDDEN",
+        )
+
+    try:
+        resolved.unlink()
+    except FileNotFoundError as exc:
+        raise ApiError(
+            f"Preset was not found: {preset_id}",
+            "PRESET_NOT_FOUND",
+        ) from exc
+    except OSError as exc:
+        raise ApiError(
+            f"Could not delete preset: {resolved}\n{exc}",
+            "PRESET_DELETE_ERROR",
+        ) from exc
+
+    return {
+        "deleted": True,
+        "preset_id": preset_id,
+        "name": str(data.get("name") or resolved.stem),
+    }
+
+
 def create_or_update_preset(
     message: Dict[str, Any],
     update: bool,
@@ -7016,6 +7063,8 @@ def handle_command(command: Dict[str, Any]) -> None:
             result = create_or_update_preset(message, update=False)
         elif command_type == "update_preset":
             result = create_or_update_preset(message, update=True)
+        elif command_type == "delete_preset":
+            result = delete_preset(message)
         elif command_type == "match":
             result = command_match(message)
         elif command_type == "shutdown":
