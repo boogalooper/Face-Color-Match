@@ -8,7 +8,6 @@
     /Events <<
         /db558f66-6e38-41e7-a274-70537f4632af [(Face Color Match) <<
             /selectedPresetId [(preset id) /string]
-            /mode [(matching mode) /string]
             /minimumGain [(minimum Delta E gain) /double]
             /strength [(strength) /integer]
             /layerName [(layer name) /string]
@@ -24,7 +23,7 @@ app.bringToFront();
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.7.5",
+            version: "0.8.0",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -170,9 +169,6 @@ app.bringToFront();
             ddPreset = presetGroup.add("dropdownlist"),
             bAdd = presetGroup.add("button", undefined, "+"),
             bUpdate = presetGroup.add("button", undefined, "↻"),
-            modeGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
-            tMode = modeGroup.add("statictext", undefined, str.mode),
-            ddMode = modeGroup.add("dropdownlist", undefined, [str.modeParametric, str.modeResidualLut]),
             strengthGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             tStrength = strengthGroup.add("statictext", undefined, str.strength),
             slStrength = strengthGroup.add("slider", undefined, cfg.data.strength, 0, 100),
@@ -189,14 +185,13 @@ app.bringToFront();
         tHeader.alignment = ["fill", "center"];
         bSettings.alignment = ["right", "center"];
         ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
-        ui.setFixedWidth(tPreset, ui.labelWidth); ui.setFixedWidth(tMode, ui.labelWidth); ui.setFixedWidth(tStrength, ui.labelWidth); ui.setFixedWidth(tGain, ui.labelWidth);
-        ui.setFixedWidth(ddPreset, 190); ui.setFixedWidth(ddMode, 205); ui.setFixedWidth(slStrength, ui.sliderWidth); ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth); ui.setFixedWidth(slGain, ui.sliderWidth); ui.setFixedWidth(tGainValue, ui.sliderValueWidth);
+        ui.setFixedWidth(tPreset, ui.labelWidth); ui.setFixedWidth(tStrength, ui.labelWidth); ui.setFixedWidth(tGain, ui.labelWidth);
+        ui.setFixedWidth(ddPreset, 190); ui.setFixedWidth(slStrength, ui.sliderWidth); ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth); ui.setFixedWidth(slGain, ui.sliderWidth); ui.setFixedWidth(tGainValue, ui.sliderValueWidth);
         ui.setFixedWidth(bAdd, ui.presetButtonWidth); ui.setFixedWidth(bUpdate, ui.presetButtonWidth);
         bSettings.helpTip = str.settings;
         bAdd.helpTip = str.createPresetHelp;
         bUpdate.helpTip = str.updatePresetHelp;
 
-        ddMode.selection = cfg.data.mode == "residual_lut" ? 1 : 0;
 
         function selectedPreset() {
             if (!ddPreset.selection) return null;
@@ -224,7 +219,6 @@ app.bringToFront();
             var item = selectedPreset();
             if (item) cfg.data.selectedPresetId = String(item.id || "");
         };
-        ddMode.onChange = function () { cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric"; };
         slStrength.onChanging = function () { tStrengthValue.text = String(Math.round(slStrength.value)) + "%"; };
         slStrength.onChange = function () { cfg.data.strength = Math.round(slStrength.value); tStrengthValue.text = String(cfg.data.strength) + "%"; };
         slGain.onChanging = function () {
@@ -273,11 +267,9 @@ app.bringToFront();
         bSettings.onClick = function () {
             cfg.data.strength = Math.round(slStrength.value);
             cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
-            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric";
             var oldFolder = cfg.data.presetFolder;
             if (settingsDialog()) {
                 if (oldFolder != cfg.data.presetFolder) refreshPresets(cfg.data.selectedPresetId);
-                ddMode.selection = cfg.data.mode == "residual_lut" ? 1 : 0;
                 slStrength.value = cfg.data.strength;
                 tStrengthValue.text = String(Math.round(cfg.data.strength)) + "%";
                 slGain.value = cfg.data.minimumGain;
@@ -289,7 +281,6 @@ app.bringToFront();
             var item = selectedPreset();
             if (!item) return;
             cfg.data.selectedPresetId = String(item.id || "");
-            cfg.data.mode = ddMode.selection && ddMode.selection.index == 1 ? "residual_lut" : "parametric";
             cfg.data.strength = Math.round(slStrength.value);
             cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
             w.close(1);
@@ -383,7 +374,7 @@ app.bringToFront();
             throw e;
         }
         if (!result) throw new Error(str.invalidCurveResult);
-        applyParametricResult(result, layerTitle(result), cfg.data.strength);
+        applyMatchResult(result, layerTitle(result), cfg.data.strength);
     }
 
     function layerTitle(result) {
@@ -411,41 +402,30 @@ app.bringToFront();
     }
 
     function toneLayerName(result) {
-        var diag = result && result.diagnostics ? result.diagnostics : null,
-            fromValue = diag && diag.delta_e_after_wb !== undefined
-                ? diag.delta_e_after_wb
-                : (diag ? diag.delta_e_before : undefined);
+        var diag = result && result.diagnostics ? result.diagnostics : null;
         if (
-            diag && fromValue !== undefined &&
-            diag.delta_e_after_tone !== undefined
+            diag &&
+            diag.tone_lightness_before !== undefined &&
+            diag.tone_lightness_after !== undefined
         ) {
-            return "Tone ΔE " + oneDecimal(fromValue) + "→" +
-                oneDecimal(diag.delta_e_after_tone);
+            return "Tone ΔL* " +
+                oneDecimal(diag.tone_lightness_before) + "→" +
+                oneDecimal(diag.tone_lightness_after);
         }
         return "Tone";
     }
 
-    function skinColorLayerName(lut) {
+    function skinMatchLayerName(lut) {
         if (
             lut && lut.delta_e_before !== undefined &&
             lut.delta_e_after !== undefined
         ) {
-            return "Skin Color ΔE " + oneDecimal(lut.delta_e_before) + "→" +
+            return "Skin Match ΔE " + oneDecimal(lut.delta_e_before) + "→" +
                 oneDecimal(lut.delta_e_after);
         }
-        return "Skin Color";
+        return "Skin Match";
     }
 
-    function residualLutLayerName(lut) {
-        if (
-            lut && lut.delta_e_before !== undefined &&
-            lut.delta_e_after !== undefined
-        ) {
-            return "Fine Tune ΔE " + oneDecimal(lut.delta_e_before) + "→" +
-                oneDecimal(lut.delta_e_after);
-        }
-        return "Fine Tune";
-    }
 
     function withPreview(callback) {
         var file = null;
@@ -470,12 +450,12 @@ app.bringToFront();
             try { if (temp.bitsPerChannel != BitsPerChannelType.EIGHT) temp.bitsPerChannel = BitsPerChannelType.EIGHT; } catch (_) { }
             var w = temp.width.as("px"), h = temp.height.as("px"), largest = Math.max(w, h), size = Math.max(640, Math.min(3000, parseInt(maxSize, 10) || 1400));
             if (largest > size) {
-                if (w >= h) temp.resizeImage(UnitValue(size, "px"), null, null, ResampleMethod.BICUBICSHARPER);
-                else temp.resizeImage(null, UnitValue(size, "px"), null, ResampleMethod.BICUBICSHARPER);
+                if (w >= h) temp.resizeImage(UnitValue(size, "px"), null, null, ResampleMethod.BICUBIC);
+                else temp.resizeImage(null, UnitValue(size, "px"), null, ResampleMethod.BICUBIC);
             }
             try { temp.flatten(); } catch (_) { }
             var options = new JPEGSaveOptions();
-            options.quality = 10;
+            options.quality = 12;
             options.embedColorProfile = true;
             options.matte = MatteType.NONE;
             options.formatOptions = FormatOptions.STANDARDBASELINE;
@@ -510,11 +490,10 @@ app.bringToFront();
         }
     }
 
-    function applyParametricResult(result, groupName, opacity) {
+    function applyMatchResult(result, groupName, opacity) {
         var doc = app.activeDocument,
             group = doc.layerSets.add(),
             skinLut = result.skin_lut || null,
-            residualLut = result.residual_lut || null,
             created = 0;
 
         try {
@@ -546,26 +525,17 @@ app.bringToFront();
             }
 
             if (skinLut && skinLut.path) {
-                createResidualLutLayer(
+                createColorLookupLayer(
                     String(skinLut.path),
                     String(skinLut.profile_path || ""),
-                    skinColorLayerName(skinLut),
+                    skinMatchLayerName(skinLut),
                     100,
                     group
                 );
                 created++;
             }
 
-            if (residualLut && residualLut.path) {
-                createResidualLutLayer(
-                    String(residualLut.path),
-                    String(residualLut.profile_path || ""),
-                    residualLutLayerName(residualLut),
-                    100,
-                    group
-                );
-                created++;
-            }
+
 
             if (!created) {
                 try { group.remove(); } catch (_) { }
@@ -581,7 +551,6 @@ app.bringToFront();
             // embeds both CUBE data and the device-link ICC into the adjustment
             // layer, so they are never needed after this apply attempt.
             removeLutTempFiles(skinLut);
-            removeLutTempFiles(residualLut);
         }
     }
 
@@ -632,7 +601,7 @@ app.bringToFront();
         }
     }
 
-    function createResidualLutLayer(cubePath, profilePath, name, opacity, parentGroup) {
+    function createColorLookupLayer(cubePath, profilePath, name, opacity, parentGroup) {
         var doc = app.activeDocument,
             cubeFile = new File(cubePath),
             profileFile = new File(profilePath),
@@ -688,7 +657,7 @@ app.bringToFront();
             // This descriptor mirrors the successful manual CUBE load captured
             // by ScriptingListener. The crucial difference from v0.2.4 is that
             // "profile" is now a complete RGB->RGB device-link ICC generated by
-            // Python from the same residual LUT.
+            // Python from the same generated LUT.
             var setDesc = new ActionDescriptor(),
                 target = new ActionReference(),
                 lookup = new ActionDescriptor();
@@ -822,9 +791,7 @@ app.bringToFront();
                 image_path: imagePath,
                 preset_folder: data.presetFolder,
                 preset_id: data.selectedPresetId,
-                mode: data.mode,
-                minimum_gain: Number(data.minimumGain),
-                use_master: true
+                minimum_gain: Number(data.minimumGain)
             }, 45000);
         };
         function call(type, message, timeout) {
@@ -928,9 +895,8 @@ app.bringToFront();
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 5,
+                actionDataVersion: 6,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
-                mode: String(cfg.data.mode || "parametric"),
                 minimumGain: gain,
                 strength: Math.round(strength),
                 layerName: String(cfg.data.layerName || "Face Color Match"),
@@ -979,8 +945,6 @@ app.bringToFront();
 
             if (values.selectedPresetId !== undefined)
                 cfg.data.selectedPresetId = String(values.selectedPresetId || "");
-            if (values.mode !== undefined)
-                cfg.data.mode = String(values.mode || "parametric");
             if (values.minimumGain !== undefined)
                 cfg.data.minimumGain = Number(values.minimumGain);
             if (values.strength !== undefined)
@@ -1173,7 +1137,7 @@ app.bringToFront();
                 ) this.data[key] = loaded[key];
             }
 
-            this.data.settingsVersion = 5;
+            this.data.settingsVersion = 6;
             normalize(this.data);
         };
 
@@ -1205,8 +1169,7 @@ app.bringToFront();
                 )).fsName,
                 selectedPresetId: "",
                 previewSize: 1400,
-                settingsVersion: 5,
-                mode: "parametric",
+                settingsVersion: 6,
                 minimumGain: 0.1,
                 strength: 100,
                 layerName: "Face Color Match",
@@ -1227,8 +1190,7 @@ app.bringToFront();
                 640,
                 Math.min(3000, parseInt(d.previewSize, 10) || 1400)
             );
-            d.settingsVersion = 5;
-            d.mode = d.mode == "residual_lut" ? "residual_lut" : "parametric";
+            d.settingsVersion = 6;
 
             if (isNaN(gain)) gain = 0.1;
             d.minimumGain = Math.max(
@@ -1258,41 +1220,106 @@ app.bringToFront();
     // ЛОКАЛИЗАЦИЯ
     // ---
     function Locale() {
-        var ru = String($.locale || app.locale || "").toLowerCase().indexOf("ru") === 0;
-        var R = {
-            noDocument: "Нет открытого документа.", preset: "Пресет", mode: "Режим", strength: "Сила",
-            modeParametric: "Smooth", modeResidualLut: "Smooth + Fine Tune", apply: "ПРИМЕНИТЬ", cancel: "Отмена", ok: "OK",
-            settings: "Настройки", createPresetHelp: "Измерить текущий документ и создать новый пресет", updatePresetHelp: "Обновить выбранный пресет из текущего документа", deletePresetHelp: "Удалить выбранный пресет",
-            presetNamePrompt: "Имя нового пресета:", updatePresetConfirm: "Обновить пресет «%s» по текущему документу?", deletePresetConfirm: "Удалить пресет «%s»?",
-            progressMeasureReference: "Измерение образца...", progressPreparePreview: "Подготовка изображения...", progressMatch: "Выравнивание цвета...",
-            progressAnalyzeFace: "Анализ лица и построение плавной коррекции...", progressCreateCurves: "Создание корректирующих слоёв и LUT...",
-            presetFolder: "Папка пресетов", previewSize: "Размер анализа, px",
-            minimumGain: "Мин. улучшение ΔE",
-            skipNoFace: "Пропускать изображение, если лицо не найдено", layerName: "Имя слоя", general: "Общие настройки",
-            serverInfo: "Python-сервер запускается автоматически и выключается через 30 минут бездействия. Версия Python выбирается автоматически из установленных поддерживаемых вариантов.", selectPresetFolder: "Выберите папку пресетов",
-            folderRequired: "Укажите папку пресетов.", noPresetSelected: "Не выбран пресет образца.", invalidCurveResult: "Python вернул некорректный результат кривых.",
-            pythonMissing: "Не найден face-color-api.pyw/.py рядом со скриптом или в подпапке lib.", pythonStartFailed: "Не удалось запустить Python-сервер.",
-            pythonTimeout: "Python-сервер не запустился за отведённое время.", pythonConnection: "Нет соединения с локальным Python API.", listenerError: "Не удалось открыть локальный порт ответа: ",
-            apiTimeout: "Истекло время ожидания ответа Python API.", apiError: "Ошибка Python API.", protocolMismatch: "Версия протокола Python API не совпадает с JSX.", serverVersionMismatch: "Версия Python-сервера не совпадает с JSX:", unsupportedPython: "Python API запущен в неподдерживаемой версии Python:",
-            logFile: "Лог", settingsWriteError: "Не удалось создать папку настроек.", actionRecordError: "Photoshop не принял параметры шага Action.", diagnostics: "Диагностика подбора", improvement: "Улучшение", correspondences: "Контрольных точек", curvePoints: "Внутренних точек", tolerance: "Допуск", lumaError: "Ошибка яркости", maxBend: "Макс. изгиб", lutFileMissing: "Не найден временный residual LUT.", lutProfileMissing: "Не найден временный ICC profile для residual LUT.", lutReadFailed: "Не удалось прочитать residual LUT.", lutProfileReadFailed: "Не удалось прочитать ICC profile residual LUT.", lutProfileInvalid: "ICC profile residual LUT повреждён или слишком мал.", lutProfileSavedAt: "ICC profile сохранён:", lutImportFailed: "Photoshop не смог автоматически загрузить residual LUT. Файл оставлен на диске:", lutLoaded: "Residual LUT загружен автоматически", lutLoadFailed: "Residual LUT был создан, но Photoshop не смог его загрузить.", lutSavedAt: "Файл LUT сохранён:", lutNotCreated: "Residual LUT не создавался", lutReasonThreshold: "после Parametric Match остаточная ошибка уже ниже порога", lutReasonGain: "расчётный LUT даёт слишком маленькое улучшение", lutReasonModel: "недостаточно надёжных данных для residual LUT", lutReasonUnknown: "нет подходящей residual-коррекции", lutThreshold: "порог", lutPredictedGain: "расчётное улучшение ΔE", lutForcedDebug: "ОТЛАДКА: LUT создан принудительно независимо от ожидаемого выигрыша ΔE.", lutExactNoProfileFailed: "Тест точного ScriptingListener-дескриптора без поля profile завершился ошибкой."
-        }, E = {
-            noDocument: "No document is open.", preset: "Preset", mode: "Mode", strength: "Strength",
-            modeParametric: "Smooth", modeResidualLut: "Smooth + Fine Tune", apply: "APPLY", cancel: "Cancel", ok: "OK",
-            settings: "Settings", createPresetHelp: "Measure the current document and create a new preset", updatePresetHelp: "Update the selected preset from the current document", deletePresetHelp: "Delete the selected preset",
-            presetNamePrompt: "New preset name:", updatePresetConfirm: "Update preset “%s” from the current document?", deletePresetConfirm: "Delete preset “%s”?",
-            progressMeasureReference: "Measuring reference...", progressPreparePreview: "Preparing image...", progressMatch: "Matching color...",
-            progressAnalyzeFace: "Analyzing face and fitting smooth match...", progressCreateCurves: "Creating adjustment layers and LUTs...",
-            presetFolder: "Preset folder", previewSize: "Analysis size, px",
-            minimumGain: "Min. ΔE improvement",
-            skipNoFace: "Skip image when no face is found", layerName: "Layer name", general: "General settings",
-            serverInfo: "The Python server starts automatically and exits after 30 minutes of inactivity. A supported installed Python is selected automatically.", selectPresetFolder: "Select preset folder",
-            folderRequired: "Select a preset folder.", noPresetSelected: "No reference preset is selected.", invalidCurveResult: "Python returned an invalid curve result.",
-            pythonMissing: "face-color-api.pyw/.py was not found next to the script or in the lib subfolder.", pythonStartFailed: "Could not start the Python server.",
-            pythonTimeout: "The Python server did not start in time.", pythonConnection: "Could not connect to the local Python API.", listenerError: "Could not open local reply port: ",
-            apiTimeout: "Timed out waiting for the Python API.", apiError: "Python API error.", protocolMismatch: "Python API protocol does not match JSX.", serverVersionMismatch: "Python server version does not match JSX:", unsupportedPython: "Python API is running under an unsupported Python version:",
-            logFile: "Log", settingsWriteError: "Could not create the settings folder.", actionRecordError: "Photoshop did not accept the Action step parameters.", diagnostics: "Fit diagnostics", improvement: "Improvement", correspondences: "Control points", curvePoints: "Internal points", tolerance: "Tolerance", lumaError: "Luma error", maxBend: "Max bend", lutFileMissing: "The temporary residual LUT file was not found.", lutProfileMissing: "The temporary residual LUT ICC profile was not found.", lutReadFailed: "Could not read the residual LUT.", lutProfileReadFailed: "Could not read the residual LUT ICC profile.", lutProfileInvalid: "The residual LUT ICC profile is invalid or truncated.", lutProfileSavedAt: "ICC profile saved at:", lutImportFailed: "Photoshop could not automatically load the residual LUT. The LUT file was left on disk:", lutLoaded: "Residual LUT loaded automatically", lutLoadFailed: "The residual LUT was generated, but Photoshop could not load it.", lutSavedAt: "LUT file saved at:", lutNotCreated: "Residual LUT was not generated", lutReasonThreshold: "the residual error after Parametric Match is already below the threshold", lutReasonGain: "the predicted LUT improvement is too small", lutReasonModel: "there is not enough reliable residual data to build a LUT", lutReasonUnknown: "no suitable residual correction was found", lutThreshold: "threshold", lutPredictedGain: "predicted ΔE improvement", lutForcedDebug: "DEBUG: LUT was generated forcibly regardless of the predicted ΔE gain.", lutExactNoProfileFailed: "The exact ScriptingListener descriptor test without the profile field failed."
-        }, key, source = ru ? R : E;
-        for (key in source) if (source.hasOwnProperty(key)) this[key] = source[key];
+        var ru = String($.locale || app.locale || "")
+                .toLowerCase().indexOf("ru") === 0,
+            R = {
+                noDocument: "Нет открытого документа.",
+                preset: "Пресет",
+                strength: "Сила",
+                minimumGain: "Мин. улучшение ΔE",
+                apply: "ПРИМЕНИТЬ",
+                cancel: "Отмена",
+                ok: "OK",
+                settings: "Настройки",
+                createPresetHelp: "Измерить текущий документ и создать новый пресет",
+                updatePresetHelp: "Обновить выбранный пресет из текущего документа",
+                presetNamePrompt: "Имя нового пресета:",
+                updatePresetConfirm: "Обновить пресет «%s» по текущему документу?",
+                progressMeasureReference: "Измерение образца...",
+                progressPreparePreview: "Подготовка изображения...",
+                progressMatch: "Выравнивание цвета...",
+                progressAnalyzeFace: "Анализ лица и расчёт коррекции...",
+                progressCreateCurves: "Создание корректирующих слоёв...",
+                presetFolder: "Папка пресетов",
+                previewSize: "Размер анализа, px",
+                skipNoFace: "Пропускать изображение, если лицо не найдено",
+                layerName: "Имя слоя",
+                general: "Общие настройки",
+                serverInfo: "Python-сервер запускается автоматически и выключается через 30 минут бездействия. Используется доступный поддерживаемый Python.",
+                selectPresetFolder: "Выберите папку пресетов",
+                folderRequired: "Укажите папку пресетов.",
+                noPresetSelected: "Не выбран пресет образца.",
+                invalidCurveResult: "Python вернул некорректный результат.",
+                pythonMissing: "Не найден face-color-api.pyw/.py рядом со скриптом или в подпапке lib.",
+                pythonStartFailed: "Не удалось запустить Python-сервер.",
+                pythonTimeout: "Python-сервер не запустился за отведённое время.",
+                pythonConnection: "Нет соединения с локальным Python API.",
+                listenerError: "Не удалось открыть локальный порт ответа: ",
+                apiTimeout: "Истекло время ожидания ответа Python API.",
+                apiError: "Ошибка Python API.",
+                protocolMismatch: "Версия протокола Python API не совпадает с JSX.",
+                serverVersionMismatch: "Версия Python-сервера не совпадает с JSX:",
+                unsupportedPython: "Python API запущен в неподдерживаемой версии Python:",
+                logFile: "Лог",
+                settingsWriteError: "Не удалось создать папку настроек.",
+                lutFileMissing: "Не найден временный LUT.",
+                lutProfileMissing: "Не найден временный ICC profile для LUT.",
+                lutReadFailed: "Не удалось прочитать LUT.",
+                lutProfileReadFailed: "Не удалось прочитать ICC profile LUT.",
+                lutProfileInvalid: "ICC profile LUT повреждён или слишком мал."
+            },
+            E = {
+                noDocument: "No document is open.",
+                preset: "Preset",
+                strength: "Strength",
+                minimumGain: "Min. ΔE improvement",
+                apply: "APPLY",
+                cancel: "Cancel",
+                ok: "OK",
+                settings: "Settings",
+                createPresetHelp: "Measure the current document and create a new preset",
+                updatePresetHelp: "Update the selected preset from the current document",
+                presetNamePrompt: "New preset name:",
+                updatePresetConfirm: "Update preset “%s” from the current document?",
+                progressMeasureReference: "Measuring reference...",
+                progressPreparePreview: "Preparing image...",
+                progressMatch: "Matching color...",
+                progressAnalyzeFace: "Analyzing face and fitting correction...",
+                progressCreateCurves: "Creating adjustment layers...",
+                presetFolder: "Preset folder",
+                previewSize: "Analysis size, px",
+                skipNoFace: "Skip image when no face is found",
+                layerName: "Layer name",
+                general: "General settings",
+                serverInfo: "The Python server starts automatically and exits after 30 minutes of inactivity. An available supported Python is used.",
+                selectPresetFolder: "Select preset folder",
+                folderRequired: "Select a preset folder.",
+                noPresetSelected: "No reference preset is selected.",
+                invalidCurveResult: "Python returned an invalid result.",
+                pythonMissing: "face-color-api.pyw/.py was not found next to the script or in the lib subfolder.",
+                pythonStartFailed: "Could not start the Python server.",
+                pythonTimeout: "The Python server did not start in time.",
+                pythonConnection: "Could not connect to the local Python API.",
+                listenerError: "Could not open the local reply port: ",
+                apiTimeout: "Timed out waiting for the Python API.",
+                apiError: "Python API error.",
+                protocolMismatch: "Python API protocol does not match JSX.",
+                serverVersionMismatch: "Python server version does not match JSX:",
+                unsupportedPython: "Python API is running under an unsupported Python version:",
+                logFile: "Log",
+                settingsWriteError: "Could not create the settings folder.",
+                lutFileMissing: "The temporary LUT file was not found.",
+                lutProfileMissing: "The temporary LUT ICC profile was not found.",
+                lutReadFailed: "Could not read the LUT.",
+                lutProfileReadFailed: "Could not read the LUT ICC profile.",
+                lutProfileInvalid: "The LUT ICC profile is invalid or truncated."
+            },
+            key,
+            source = ru ? R : E;
+
+        for (key in source)
+            if (source.hasOwnProperty(key))
+                this[key] = source[key];
     }
 
     // ---
