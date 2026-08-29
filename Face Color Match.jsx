@@ -10,6 +10,8 @@
             /selectedPresetId [(preset id) /string]
             /minimumGain [(minimum Delta E gain) /double]
             /strength [(strength) /integer]
+            /lightnessBalance [(lightness balance) /integer]
+            /protectionBias [(accuracy safety balance) /integer]
             /layerName [(layer name) /string]
             /skipNoFace [(skip if no face) /boolean]
         >>]
@@ -20,10 +22,20 @@
 */
 app.bringToFront();
 
+// Photoshop evaluates suspendHistory callbacks in the global script scope.
+// Keep only a temporary closure here; the actual implementation remains
+// inside the main module.
+var faceColorMatchHistoryCallback = null;
+function faceColorMatchApplyHistory() {
+    if (!faceColorMatchHistoryCallback)
+        throw new Error("Face Color Match history callback is not available.");
+    return faceColorMatchHistoryCallback();
+}
+
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.8.0",
+            version: "0.9.5",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -91,10 +103,10 @@ app.bringToFront();
         var self = this;
 
         this.mainWindowWidth = 370;
-        this.labelWidth = 78;
+        this.labelWidth = 118;
         this.mainSettingsButtonWidth = 28;
         this.presetButtonWidth = 28;
-        this.sliderWidth = 170;
+        this.sliderWidth = 160;
         this.sliderValueWidth = 46;
         this.progressWidth = 330;
 
@@ -129,8 +141,68 @@ app.bringToFront();
             return dialog.show();
         };
 
-        this.progress = function (title, fn) {
-            if (actionPlaybackMode && !interfaceWasShown)
+        this.centeredSliderText = function (value) {
+            value = Math.round(Number(value) || 0);
+            if (value > 0) return "+" + String(value);
+            return String(value);
+        };
+
+        this.createSliderStepper = function (slider, step, origin) {
+            step = Math.abs(Number(step));
+            if (!isFinite(step) || step <= 0) step = 1;
+            origin = Number(origin);
+            if (!isFinite(origin)) origin = Number(slider.minvalue) || 0;
+
+            var state = {
+                slider: slider,
+                step: step,
+                origin: origin,
+                snappedValue: null,
+                pointerActive: false
+            };
+
+            try {
+                slider.addEventListener("mousedown", function () {
+                    state.pointerActive = true;
+                });
+            } catch (_) { }
+
+            state.sync = function (reset) {
+                var raw = Number(slider.value),
+                    previous = reset ? null : state.snappedValue,
+                    value;
+
+                if (!state.pointerActive && previous !== null && raw != previous)
+                    value = previous + (raw > previous ? step : -step);
+                else
+                    value = Math.round((raw - origin) / step) * step + origin;
+
+                value = Math.max(
+                    Number(slider.minvalue),
+                    Math.min(Number(slider.maxvalue), value)
+                );
+                slider.value = value;
+                state.snappedValue = value;
+                return value;
+            };
+
+            state.reset = function (value) {
+                if (value !== undefined) slider.value = value;
+                return state.sync(true);
+            };
+
+            state.finish = function () {
+                var value = state.sync(false);
+                state.pointerActive = false;
+                return value;
+            };
+
+            state.sync(true);
+            return state;
+        };
+
+        this.progress = function (title, fn, forceVisible) {
+            if (!forceVisible && actionPlaybackMode && !interfaceWasShown)
                 return fn(function () { });
 
             var w = new Window(
@@ -173,25 +245,43 @@ app.bringToFront();
             tStrength = strengthGroup.add("statictext", undefined, str.strength),
             slStrength = strengthGroup.add("slider", undefined, cfg.data.strength, 0, 100),
             tStrengthValue = strengthGroup.add("statictext", undefined, String(Math.round(cfg.data.strength)) + "%"),
-            gainGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
-            tGain = gainGroup.add("statictext", undefined, str.minimumGain),
-            slGain = gainGroup.add("slider", undefined, cfg.data.minimumGain, 0, 2),
-            tGainValue = gainGroup.add("statictext", undefined, oneDecimal(cfg.data.minimumGain)),
+            toneGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
+            tTone = toneGroup.add("statictext", undefined, str.lightnessBalance),
+            slTone = toneGroup.add("slider", undefined, cfg.data.lightnessBalance, -100, 100),
+            tToneValue = toneGroup.add("statictext", undefined, ""),
+            protectionGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
+            tProtection = protectionGroup.add("statictext", undefined, str.protectionBias),
+            slProtection = protectionGroup.add("slider", undefined, cfg.data.protectionBias, -100, 100),
+            tProtectionValue = protectionGroup.add("statictext", undefined, ""),
             gOk = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,6,0,0]}"),
             bOk = gOk.add("button", undefined, str.apply, { name: "ok" }),
-            bCancel = gOk.add("button", undefined, str.cancel, { name: "cancel" });
+            bCancel = gOk.add("button", undefined, str.cancel, { name: "cancel" }),
+            toneStepper = ui.createSliderStepper(slTone, 1, 0),
+            protectionStepper = ui.createSliderStepper(slProtection, 1, 0);
 
         ui.setFixedWidth(w, ui.mainWindowWidth);
         tHeader.alignment = ["fill", "center"];
         bSettings.alignment = ["right", "center"];
         ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
-        ui.setFixedWidth(tPreset, ui.labelWidth); ui.setFixedWidth(tStrength, ui.labelWidth); ui.setFixedWidth(tGain, ui.labelWidth);
-        ui.setFixedWidth(ddPreset, 190); ui.setFixedWidth(slStrength, ui.sliderWidth); ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth); ui.setFixedWidth(slGain, ui.sliderWidth); ui.setFixedWidth(tGainValue, ui.sliderValueWidth);
-        ui.setFixedWidth(bAdd, ui.presetButtonWidth); ui.setFixedWidth(bUpdate, ui.presetButtonWidth);
+        ui.setFixedWidth(tPreset, ui.labelWidth);
+        ui.setFixedWidth(tStrength, ui.labelWidth);
+        ui.setFixedWidth(tTone, ui.labelWidth);
+        ui.setFixedWidth(tProtection, ui.labelWidth);
+        ui.setFixedWidth(ddPreset, 150);
+        ui.setFixedWidth(slStrength, ui.sliderWidth);
+        ui.setFixedWidth(slTone, ui.sliderWidth);
+        ui.setFixedWidth(slProtection, ui.sliderWidth);
+        ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth);
+        ui.setFixedWidth(tToneValue, ui.sliderValueWidth);
+        ui.setFixedWidth(tProtectionValue, ui.sliderValueWidth);
+        ui.setFixedWidth(bAdd, ui.presetButtonWidth);
+        ui.setFixedWidth(bUpdate, ui.presetButtonWidth);
         bSettings.helpTip = str.settings;
         bAdd.helpTip = str.createPresetHelp;
         bUpdate.helpTip = str.updatePresetHelp;
-
+        tStrength.helpTip = slStrength.helpTip = tStrengthValue.helpTip = str.strengthHelp;
+        tTone.helpTip = slTone.helpTip = tToneValue.helpTip = str.lightnessBalanceHelp;
+        tProtection.helpTip = slProtection.helpTip = tProtectionValue.helpTip = str.protectionBiasHelp;
 
         function selectedPreset() {
             if (!ddPreset.selection) return null;
@@ -213,7 +303,31 @@ app.bringToFront();
             state.presets = api.listPresets(cfg.data.presetFolder);
             repopulate(selectId);
         }
+        function syncToneText(finalize) {
+            var pointerActive = toneStepper.pointerActive,
+                value = finalize ? toneStepper.finish() : toneStepper.sync(false);
+            if (pointerActive && value >= -8 && value <= 8) {
+                value = 0;
+                toneStepper.reset(0);
+            }
+            if (finalize) cfg.data.lightnessBalance = Math.round(value);
+            tToneValue.text = ui.centeredSliderText(value);
+        }
+        function syncProtectionText(finalize) {
+            var pointerActive = protectionStepper.pointerActive,
+                value = finalize ? protectionStepper.finish() : protectionStepper.sync(false);
+            if (pointerActive && value >= -8 && value <= 8) {
+                value = 0;
+                protectionStepper.reset(0);
+            }
+            if (finalize) cfg.data.protectionBias = Math.round(value);
+            tProtectionValue.text = ui.centeredSliderText(value);
+        }
         repopulate(cfg.data.selectedPresetId);
+        toneStepper.reset(Number(cfg.data.lightnessBalance) || 0);
+        protectionStepper.reset(Number(cfg.data.protectionBias) || 0);
+        syncToneText(false);
+        syncProtectionText(false);
 
         ddPreset.onChange = function () {
             var item = selectedPreset();
@@ -221,14 +335,10 @@ app.bringToFront();
         };
         slStrength.onChanging = function () { tStrengthValue.text = String(Math.round(slStrength.value)) + "%"; };
         slStrength.onChange = function () { cfg.data.strength = Math.round(slStrength.value); tStrengthValue.text = String(cfg.data.strength) + "%"; };
-        slGain.onChanging = function () {
-            var value = Math.round(Number(slGain.value) * 10) / 10;
-            tGainValue.text = value.toFixed(1);
-        };
-        slGain.onChange = function () {
-            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
-            tGainValue.text = cfg.data.minimumGain.toFixed(1);
-        };
+        slTone.onChanging = function () { syncToneText(false); };
+        slTone.onChange = function () { syncToneText(true); };
+        slProtection.onChanging = function () { syncProtectionText(false); };
+        slProtection.onChange = function () { syncProtectionText(true); };
 
         bAdd.onClick = function () {
             var defaultName = stripExtension(app.activeDocument.name),
@@ -241,7 +351,7 @@ app.bringToFront();
                     setProgress(str.progressPreparePreview, 20);
                     return withPreview(function (file) {
                         setProgress(str.progressMeasureReference, 55);
-                        return api.createPreset(file.fsName, cfg.data.presetFolder, name, app.activeDocument.name);
+                        return api.createPreset(file.fsName, cfg.data.presetFolder, name, app.activeDocument.name, cfg.data.previewSize);
                     });
                 });
                 refreshPresets(result && result.preset ? result.preset.id : "");
@@ -257,7 +367,7 @@ app.bringToFront();
                     setProgress(str.progressPreparePreview, 20);
                     return withPreview(function (file) {
                         setProgress(str.progressMeasureReference, 55);
-                        return api.updatePreset(file.fsName, cfg.data.presetFolder, item.id, item.path, app.activeDocument.name);
+                        return api.updatePreset(file.fsName, cfg.data.presetFolder, item.id, item.path, app.activeDocument.name, cfg.data.previewSize);
                     });
                 });
                 refreshPresets(result && result.preset ? result.preset.id : item.id);
@@ -266,14 +376,17 @@ app.bringToFront();
 
         bSettings.onClick = function () {
             cfg.data.strength = Math.round(slStrength.value);
-            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
+            syncToneText(true);
+            syncProtectionText(true);
             var oldFolder = cfg.data.presetFolder;
             if (settingsDialog()) {
                 if (oldFolder != cfg.data.presetFolder) refreshPresets(cfg.data.selectedPresetId);
                 slStrength.value = cfg.data.strength;
                 tStrengthValue.text = String(Math.round(cfg.data.strength)) + "%";
-                slGain.value = cfg.data.minimumGain;
-                tGainValue.text = Number(cfg.data.minimumGain).toFixed(1);
+                toneStepper.reset(Number(cfg.data.lightnessBalance) || 0);
+                protectionStepper.reset(Number(cfg.data.protectionBias) || 0);
+                syncToneText(false);
+                syncProtectionText(false);
             }
         };
 
@@ -282,7 +395,8 @@ app.bringToFront();
             if (!item) return;
             cfg.data.selectedPresetId = String(item.id || "");
             cfg.data.strength = Math.round(slStrength.value);
-            cfg.data.minimumGain = Math.round(Number(slGain.value) * 10) / 10;
+            syncToneText(true);
+            syncProtectionText(true);
             w.close(1);
         };
         bCancel.onClick = function () { w.close(0); };
@@ -374,7 +488,21 @@ app.bringToFront();
             throw e;
         }
         if (!result) throw new Error(str.invalidCurveResult);
-        applyMatchResult(result, layerTitle(result), cfg.data.strength);
+        applyMatchResultInHistory(result, layerTitle(result), cfg.data.strength);
+    }
+
+    function applyMatchResultInHistory(result, groupName, opacity) {
+        faceColorMatchHistoryCallback = function () {
+            return applyMatchResult(result, groupName, opacity);
+        };
+        try {
+            app.activeDocument.suspendHistory(
+                str.historyApplyMatch,
+                "faceColorMatchApplyHistory()"
+            );
+        } finally {
+            faceColorMatchHistoryCallback = null;
+        }
     }
 
     function layerTitle(result) {
@@ -402,15 +530,27 @@ app.bringToFront();
     }
 
     function toneLayerName(result) {
-        var diag = result && result.diagnostics ? result.diagnostics : null;
-        if (
-            diag &&
-            diag.tone_lightness_before !== undefined &&
-            diag.tone_lightness_after !== undefined
-        ) {
-            return "Tone ΔL* " +
-                oneDecimal(diag.tone_lightness_before) + "→" +
-                oneDecimal(diag.tone_lightness_after);
+        var diag = result && result.diagnostics ? result.diagnostics : null,
+            deBefore = null,
+            deAfter = null;
+        if (diag) {
+            if (diag.delta_e_after_wb !== undefined)
+                deBefore = diag.delta_e_after_wb;
+            else if (diag.delta_e_before !== undefined)
+                deBefore = diag.delta_e_before;
+            if (diag.delta_e_after_tone !== undefined)
+                deAfter = diag.delta_e_after_tone;
+        }
+        if (deBefore !== null && deAfter !== null) {
+            var name = "Tone ΔE " + oneDecimal(deBefore) + "→" + oneDecimal(deAfter);
+            if (
+                diag.tone_lightness_before !== undefined &&
+                diag.tone_lightness_after !== undefined
+            ) {
+                name += " · ΔL* " + oneDecimal(diag.tone_lightness_before) +
+                    "→" + oneDecimal(diag.tone_lightness_after);
+            }
+            return name;
         }
         return "Tone";
     }
@@ -439,34 +579,18 @@ app.bringToFront();
 
     function createPreview(maxSize) {
         var original = app.activeDocument,
-            temp = null,
             file = new File(Folder.temp.fsName + "/face-color-match-" + (new Date()).getTime() + "-" + Math.floor(Math.random() * 1000000) + ".jpg");
         try {
-            temp = original.duplicate("Face Color Match preview", true);
-            app.activeDocument = temp;
-            try { temp.convertProfile("sRGB IEC61966-2.1", Intent.RELATIVECOLORIMETRIC, true, true); } catch (_) { }
-            try { if (temp.mode != DocumentMode.RGB) temp.changeMode(ChangeMode.RGB); } catch (_) { }
-            try { temp.convertProfile("sRGB IEC61966-2.1", Intent.RELATIVECOLORIMETRIC, true, true); } catch (_) { }
-            try { if (temp.bitsPerChannel != BitsPerChannelType.EIGHT) temp.bitsPerChannel = BitsPerChannelType.EIGHT; } catch (_) { }
-            var w = temp.width.as("px"), h = temp.height.as("px"), largest = Math.max(w, h), size = Math.max(640, Math.min(3000, parseInt(maxSize, 10) || 1400));
-            if (largest > size) {
-                if (w >= h) temp.resizeImage(UnitValue(size, "px"), null, null, ResampleMethod.BICUBIC);
-                else temp.resizeImage(null, UnitValue(size, "px"), null, ResampleMethod.BICUBIC);
-            }
-            try { temp.flatten(); } catch (_) { }
             var options = new JPEGSaveOptions();
             options.quality = 12;
             options.embedColorProfile = true;
             options.matte = MatteType.NONE;
             options.formatOptions = FormatOptions.STANDARDBASELINE;
-            temp.saveAs(file, options, true, Extension.LOWERCASE);
-            temp.close(SaveOptions.DONOTSAVECHANGES);
-            temp = null;
-            app.activeDocument = original;
+            // Save a safe flattened copy of the current document without
+            // duplicating it. Python performs any analysis downscale itself.
+            original.saveAs(file, options, true, Extension.LOWERCASE);
             return file;
         } catch (e) {
-            if (temp) try { temp.close(SaveOptions.DONOTSAVECHANGES); } catch (_) { }
-            try { app.activeDocument = original; } catch (_) { }
             if (file.exists) try { file.remove(); } catch (_) { }
             throw e;
         }
@@ -740,36 +864,107 @@ app.bringToFront();
     function BridgeApi() {
         var self = this;
         this.initialize = function () {
+            var runningInfo = null,
+                restartOldServer = false;
+
             if (checkConnection(APP.apiHost, APP.apiPortSend)) {
-                var runningInfo = self.ping();
-                if (runningInfo && String(runningInfo.version || "") != String(APP.version)) {
-                    try { self.shutdown(); } catch (_) { }
-                    var stopDeadline = (new Date()).getTime() + 5000;
-                    while ((new Date()).getTime() < stopDeadline && checkConnection(APP.apiHost, APP.apiPortSend)) $.sleep(80);
-                } else {
+                runningInfo = self.ping();
+                if (
+                    runningInfo &&
+                    String(runningInfo.version || "") == String(APP.version)
+                ) {
                     validatePing(runningInfo);
                     clearBridgeTempFiles();
                     return;
                 }
+                restartOldServer = true;
             }
-            writeLaunchConfig();
-            clearStartupStatus();
-            var pythonFile = findPythonModule();
-            if (!pythonFile) throw new Error(str.pythonMissing);
-            if (pythonFile.execute() === false) throw new Error(str.pythonStartFailed + "\n" + pythonFile.fsName);
-            var deadline = (new Date()).getTime() + 45000, last = null;
-            while ((new Date()).getTime() < deadline) {
-                if (checkConnection(APP.apiHost, APP.apiPortSend)) {
-                    validatePing(self.ping());
-                    clearBridgeTempFiles();
-                    return;
-                }
-                last = readStartupStatus();
-                if (last && last.status == "error") throw new Error(last.message + (last.log_file ? "\n\n" + str.logFile + ":\n" + last.log_file : ""));
-                $.sleep(100);
-            }
-            last = readStartupStatus();
-            throw new Error(str.pythonTimeout + (last && last.message ? "\n\n" + last.message : ""));
+
+            // A server start can take a few seconds on the first Python/OpenCV
+            // import. Show progress even during silent Action playback so
+            // Photoshop never looks frozen while the local API is starting.
+            return ui.progress(
+                str.progressStartServer,
+                function (setProgress) {
+                    var stopDeadline, startTime, deadline, last, elapsed, value,
+                        pythonFile;
+
+                    if (restartOldServer) {
+                        setProgress(str.progressRestartServer, 8);
+                        try { self.shutdown(); } catch (_) { }
+
+                        stopDeadline = (new Date()).getTime() + 5000;
+                        while (
+                            (new Date()).getTime() < stopDeadline &&
+                            checkConnection(APP.apiHost, APP.apiPortSend)
+                        ) {
+                            elapsed = 5000 - (stopDeadline - (new Date()).getTime());
+                            value = 8 + Math.min(12, Math.round(elapsed / 5000 * 12));
+                            setProgress(str.progressRestartServer, value);
+                            $.sleep(80);
+                        }
+                    }
+
+                    setProgress(str.progressPrepareServer, 22);
+                    writeLaunchConfig();
+                    clearStartupStatus();
+
+                    pythonFile = findPythonModule();
+                    if (!pythonFile) throw new Error(str.pythonMissing);
+
+                    setProgress(str.progressLaunchPython, 30);
+                    if (pythonFile.execute() === false)
+                        throw new Error(
+                            str.pythonStartFailed + "\n" + pythonFile.fsName
+                        );
+
+                    startTime = (new Date()).getTime();
+                    deadline = startTime + 45000;
+                    last = null;
+
+                    while ((new Date()).getTime() < deadline) {
+                        if (checkConnection(APP.apiHost, APP.apiPortSend)) {
+                            setProgress(str.progressCheckServer, 96);
+                            validatePing(self.ping());
+                            clearBridgeTempFiles();
+                            setProgress(str.progressServerReady, 100);
+                            $.sleep(80);
+                            return;
+                        }
+
+                        last = readStartupStatus();
+                        if (last && last.status == "error")
+                            throw new Error(
+                                last.message +
+                                (last.log_file
+                                    ? "\n\n" + str.logFile + ":\n" + last.log_file
+                                    : "")
+                            );
+
+                        elapsed = (new Date()).getTime() - startTime;
+                        value = 32 + Math.min(
+                            61,
+                            Math.round(elapsed / 45000 * 61)
+                        );
+
+                        if (last && last.status == "starting")
+                            setProgress(str.progressLoadPython, value);
+                        else
+                            setProgress(str.progressWaitServer, value);
+
+                        $.sleep(100);
+                    }
+
+                    last = readStartupStatus();
+                    throw new Error(
+                        str.pythonTimeout +
+                        (last && last.message
+                            ? "\n\n" + last.message
+                            : "")
+                    );
+                },
+                true
+            );
         };
         this.ping = function () { return call("ping", {}, 6000); };
         this.shutdown = function () { return call("shutdown", {}, 4000); };
@@ -777,11 +972,24 @@ app.bringToFront();
             var result = call("list_presets", { preset_folder: folder }, 10000);
             return result && result.presets instanceof Array ? result.presets : [];
         };
-        this.createPreset = function (imagePath, folder, name, sourceName) {
-            return call("create_preset", { image_path: imagePath, preset_folder: folder, name: name, source_name: sourceName }, 45000);
+        this.createPreset = function (imagePath, folder, name, sourceName, previewSize) {
+            return call("create_preset", {
+                image_path: imagePath,
+                preset_folder: folder,
+                name: name,
+                source_name: sourceName,
+                preview_size: parseInt(previewSize, 10) || 1400
+            }, 45000);
         };
-        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName) {
-            return call("update_preset", { image_path: imagePath, preset_folder: folder, preset_id: presetId, preset_path: presetPath, source_name: sourceName }, 45000);
+        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName, previewSize) {
+            return call("update_preset", {
+                image_path: imagePath,
+                preset_folder: folder,
+                preset_id: presetId,
+                preset_path: presetPath,
+                source_name: sourceName,
+                preview_size: parseInt(previewSize, 10) || 1400
+            }, 45000);
         };
         this.deletePreset = function (folder, presetId, presetPath) {
             return call("delete_preset", { preset_folder: folder, preset_id: presetId, preset_path: presetPath }, 10000);
@@ -791,7 +999,10 @@ app.bringToFront();
                 image_path: imagePath,
                 preset_folder: data.presetFolder,
                 preset_id: data.selectedPresetId,
-                minimum_gain: Number(data.minimumGain)
+                minimum_gain: Number(data.minimumGain),
+                preview_size: parseInt(data.previewSize, 10) || 1400,
+                lightness_balance: parseInt(data.lightnessBalance, 10) || 0,
+                protection_bias: parseInt(data.protectionBias, 10) || 0
             }, 45000);
         };
         function call(type, message, timeout) {
@@ -828,8 +1039,9 @@ app.bringToFront();
         function validatePing(info) {
             if (!info || Number(info.protocol) != APP.apiProtocol) throw new Error(str.protocolMismatch);
             if (String(info.version || "") != String(APP.version)) throw new Error(str.serverVersionMismatch + " " + String(info.version || "?") + " / " + APP.version);
-            var py = String(info.python || "");
-            if (py.indexOf("3.11.") !== 0 && py.indexOf("3.14.") !== 0) throw new Error(str.unsupportedPython + " " + py);
+            var py = String(info.python || ""),
+                match = py.match(/^3\.(11|12|13|14)\./);
+            if (!match) throw new Error(str.unsupportedPython + " " + py);
         }
         function writeLaunchConfig() {
             writeTextFile(new File(Folder.temp.fsName + "/" + APP.launchFile), jsonStringify({ python_version: "auto", time: (new Date()).getTime() }));
@@ -895,10 +1107,12 @@ app.bringToFront();
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 6,
+                actionDataVersion: 7,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
                 minimumGain: gain,
                 strength: Math.round(strength),
+                lightnessBalance: Math.round(Number(cfg.data.lightnessBalance) || 0),
+                protectionBias: Math.round(Number(cfg.data.protectionBias) || 0),
                 layerName: String(cfg.data.layerName || "Face Color Match"),
                 skipNoFace: !!cfg.data.skipNoFace
             };
@@ -949,6 +1163,10 @@ app.bringToFront();
                 cfg.data.minimumGain = Number(values.minimumGain);
             if (values.strength !== undefined)
                 cfg.data.strength = Number(values.strength);
+            if (values.lightnessBalance !== undefined)
+                cfg.data.lightnessBalance = Number(values.lightnessBalance);
+            if (values.protectionBias !== undefined)
+                cfg.data.protectionBias = Number(values.protectionBias);
             if (values.layerName !== undefined)
                 cfg.data.layerName = String(values.layerName || "Face Color Match");
             if (values.skipNoFace !== undefined)
@@ -1137,7 +1355,7 @@ app.bringToFront();
                 ) this.data[key] = loaded[key];
             }
 
-            this.data.settingsVersion = 6;
+            this.data.settingsVersion = 7;
             normalize(this.data);
         };
 
@@ -1169,9 +1387,11 @@ app.bringToFront();
                 )).fsName,
                 selectedPresetId: "",
                 previewSize: 1400,
-                settingsVersion: 6,
+                settingsVersion: 7,
                 minimumGain: 0.1,
                 strength: 100,
+                lightnessBalance: 0,
+                protectionBias: 0,
                 layerName: "Face Color Match",
                 skipNoFace: false
             };
@@ -1190,7 +1410,7 @@ app.bringToFront();
                 640,
                 Math.min(3000, parseInt(d.previewSize, 10) || 1400)
             );
-            d.settingsVersion = 6;
+            d.settingsVersion = 7;
 
             if (isNaN(gain)) gain = 0.1;
             d.minimumGain = Math.max(
@@ -1205,6 +1425,8 @@ app.bringToFront();
             );
 
             d.layerName = String(d.layerName || "Face Color Match");
+            d.lightnessBalance = Math.max(-100, Math.min(100, Math.round(Number(d.lightnessBalance) || 0)));
+            d.protectionBias = Math.max(-100, Math.min(100, Math.round(Number(d.protectionBias) || 0)));
             d.skipNoFace = !!d.skipNoFace;
         }
 
@@ -1227,14 +1449,28 @@ app.bringToFront();
                 preset: "Пресет",
                 strength: "Сила",
                 minimumGain: "Мин. улучшение ΔE",
-                apply: "ПРИМЕНИТЬ",
+                lightnessBalance: "Тени / света",
+                protectionBias: "Точность / защита",
+                apply: "Применить",
                 cancel: "Отмена",
                 ok: "OK",
                 settings: "Настройки",
                 createPresetHelp: "Измерить текущий документ и создать новый пресет",
+                strengthHelp: "Общая сила применения найденной коррекции. 100% — полный эффект, меньшие значения ослабляют все созданные корректирующие слои как одну группу.",
+                lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
+                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. В сторону «Точность» алгоритм ослабляет часть защитных порогов и может проверить Skin Match до 120% расчётной силы, но оставляет только реально улучшающий и не катастрофический вариант. В сторону «Защита» максимальная сила Skin Match плавно снижается до 60%, усиливается защита фона и ограничивается внутренняя доводка.",
+                historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Обновить выбранный пресет из текущего документа",
                 presetNamePrompt: "Имя нового пресета:",
                 updatePresetConfirm: "Обновить пресет «%s» по текущему документу?",
+                progressStartServer: "Запуск локального сервера...",
+                progressRestartServer: "Перезапуск локального сервера...",
+                progressPrepareServer: "Подготовка запуска Python...",
+                progressLaunchPython: "Запуск Python...",
+                progressLoadPython: "Загрузка Python и модулей...",
+                progressWaitServer: "Ожидание локального сервера...",
+                progressCheckServer: "Проверка соединения...",
+                progressServerReady: "Сервер готов.",
                 progressMeasureReference: "Измерение образца...",
                 progressPreparePreview: "Подготовка изображения...",
                 progressMatch: "Выравнивание цвета...",
@@ -1245,7 +1481,7 @@ app.bringToFront();
                 skipNoFace: "Пропускать изображение, если лицо не найдено",
                 layerName: "Имя слоя",
                 general: "Общие настройки",
-                serverInfo: "Python-сервер запускается автоматически и выключается через 30 минут бездействия. Используется доступный поддерживаемый Python.",
+                serverInfo: "Фоновый сервис запускается автоматически и выключается через 30 минут бездействия.",
                 selectPresetFolder: "Выберите папку пресетов",
                 folderRequired: "Укажите папку пресетов.",
                 noPresetSelected: "Не выбран пресет образца.",
@@ -1273,14 +1509,28 @@ app.bringToFront();
                 preset: "Preset",
                 strength: "Strength",
                 minimumGain: "Min. ΔE improvement",
-                apply: "APPLY",
+                lightnessBalance: "Shadows / highlights",
+                protectionBias: "Accuracy / safety",
+                apply: "Apply",
                 cancel: "Cancel",
                 ok: "OK",
                 settings: "Settings",
                 createPresetHelp: "Measure the current document and create a new preset",
+                strengthHelp: "Overall strength of the fitted correction. 100% keeps the full effect; lower values reduce the opacity of the created adjustment group.",
+                lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
+                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Toward Accuracy some safety thresholds are relaxed and the script may test Skin Match up to 120% of the fitted strength, keeping it only when measured skin ΔE genuinely improves without catastrophic spill. Toward Safety the maximum Skin Match strength falls progressively to 60%, background protection becomes stricter, and internal refinement is limited.",
+                historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Update the selected preset from the current document",
                 presetNamePrompt: "New preset name:",
                 updatePresetConfirm: "Update preset “%s” from the current document?",
+                progressStartServer: "Starting local server...",
+                progressRestartServer: "Restarting local server...",
+                progressPrepareServer: "Preparing Python launch...",
+                progressLaunchPython: "Starting Python...",
+                progressLoadPython: "Loading Python and modules...",
+                progressWaitServer: "Waiting for local server...",
+                progressCheckServer: "Checking connection...",
+                progressServerReady: "Server ready.",
                 progressMeasureReference: "Measuring reference...",
                 progressPreparePreview: "Preparing image...",
                 progressMatch: "Matching color...",
@@ -1291,7 +1541,7 @@ app.bringToFront();
                 skipNoFace: "Skip image when no face is found",
                 layerName: "Layer name",
                 general: "General settings",
-                serverInfo: "The Python server starts automatically and exits after 30 minutes of inactivity. An available supported Python is used.",
+                serverInfo: "The background service starts automatically and exits after 30 minutes of inactivity.",
                 selectPresetFolder: "Select preset folder",
                 folderRequired: "Select a preset folder.",
                 noPresetSelected: "No reference preset is selected.",
