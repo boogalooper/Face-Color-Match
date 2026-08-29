@@ -24,13 +24,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.9.5"
+VERSION = "0.10.0"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
 API_REPLY_PORT = 42972
 IDLE_TIMEOUT_SECONDS = 30 * 60
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MINIMUM_STAGE_GAIN = 0.1
 SUPPORTED_PYTHON = {(3, minor) for minor in range(11, 15)}
 SUPPORTED_PYTHON_NAMES = ("3.14", "3.13", "3.12", "3.11")
 
@@ -310,19 +311,118 @@ def error_reply(request_id: str, exc: Exception) -> None:
     send_reply(payload)
 
 
-def imread_unicode(path: str) -> np.ndarray:
+def _read_image_bytes(path: str) -> Tuple[Path, np.ndarray]:
     p = Path(path)
     if not p.is_file():
-        raise ApiError(f"Image file does not exist: {path}", "IMAGE_NOT_FOUND")
+        raise ApiError(
+            f"Image file does not exist: {path}",
+            "IMAGE_NOT_FOUND",
+        )
     try:
         raw = np.fromfile(str(p), dtype=np.uint8)
-        image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
     except Exception as exc:
-        raise ApiError(f"Could not read image: {path}\n{exc}", "IMAGE_READ_ERROR")
-    if image is None or image.size == 0:
-        raise ApiError(f"Could not decode image: {path}", "IMAGE_READ_ERROR")
-    return image
+        raise ApiError(
+            f"Could not read image: {path}\n{exc}",
+            "IMAGE_READ_ERROR",
+        )
+    if raw.size == 0:
+        raise ApiError(
+            f"Image file is empty: {path}",
+            "IMAGE_READ_ERROR",
+        )
+    return p, raw
 
+
+def _jpeg_dimensions(raw: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Read JPEG SOF dimensions without decoding the full image."""
+    data = memoryview(np.asarray(raw, dtype=np.uint8))
+    size = len(data)
+    if size < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3,
+        0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB,
+        0xCD, 0xCE, 0xCF,
+    }
+    i = 2
+    while i + 3 < size:
+        while i < size and data[i] != 0xFF:
+            i += 1
+        while i < size and data[i] == 0xFF:
+            i += 1
+        if i >= size:
+            break
+        marker = int(data[i])
+        i += 1
+        if marker in (0xD8, 0xD9):
+            continue
+        if marker == 0xDA:  # Start of scan: SOF must already have appeared.
+            break
+        if i + 1 >= size:
+            break
+        segment_len = (int(data[i]) << 8) | int(data[i + 1])
+        if segment_len < 2 or i + segment_len > size:
+            break
+        if marker in sof_markers and segment_len >= 7:
+            height = (int(data[i + 3]) << 8) | int(data[i + 4])
+            width = (int(data[i + 5]) << 8) | int(data[i + 6])
+            if width > 0 and height > 0:
+                return width, height
+        i += segment_len
+    return None
+
+
+def _jpeg_reduced_decode_flag(
+    raw: np.ndarray,
+    max_size: Optional[int],
+) -> int:
+    max_size = int(max_size or 0)
+    if max_size <= 0:
+        return cv2.IMREAD_COLOR
+    dimensions = _jpeg_dimensions(raw)
+    if not dimensions:
+        return cv2.IMREAD_COLOR
+    longest = max(dimensions)
+
+    # Decode at the largest native JPEG reduction that still leaves enough
+    # pixels for the requested analysis size, then do one exact INTER_AREA
+    # resize. This avoids decoding a 40–60 MP temporary JPEG at full size.
+    flags = (
+        (8, getattr(cv2, "IMREAD_REDUCED_COLOR_8", cv2.IMREAD_COLOR)),
+        (4, getattr(cv2, "IMREAD_REDUCED_COLOR_4", cv2.IMREAD_COLOR)),
+        (2, getattr(cv2, "IMREAD_REDUCED_COLOR_2", cv2.IMREAD_COLOR)),
+    )
+    for divisor, flag in flags:
+        if longest / float(divisor) >= max_size * 1.02:
+            return int(flag)
+    return cv2.IMREAD_COLOR
+
+
+def imread_analysis_unicode(
+    path: str,
+    max_size: Optional[int],
+) -> np.ndarray:
+    p, raw = _read_image_bytes(path)
+    flag = (
+        _jpeg_reduced_decode_flag(raw, max_size)
+        if p.suffix.lower() in {".jpg", ".jpeg"}
+        else cv2.IMREAD_COLOR
+    )
+    try:
+        image = cv2.imdecode(raw, flag)
+    except Exception as exc:
+        raise ApiError(
+            f"Could not decode image: {path}\n{exc}",
+            "IMAGE_READ_ERROR",
+        )
+    if image is None or image.size == 0:
+        raise ApiError(
+            f"Could not decode image: {path}",
+            "IMAGE_READ_ERROR",
+        )
+    return prepare_analysis_image(image, max_size)
 
 
 def prepare_analysis_image(image: np.ndarray, max_size: Optional[int]) -> np.ndarray:
@@ -339,8 +439,58 @@ def prepare_analysis_image(image: np.ndarray, max_size: Optional[int]) -> np.nda
     return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
+_YUNET_DETECTOR: Any = None
+_YUNET_DETECTOR_FAILED = False
+_HAAR_CASCADE: Any = None
+
+
+def _get_yunet_detector() -> Any:
+    global _YUNET_DETECTOR, _YUNET_DETECTOR_FAILED
+    if _YUNET_DETECTOR is not None:
+        return _YUNET_DETECTOR
+    if _YUNET_DETECTOR_FAILED:
+        return None
+    if (
+        not YUNET_MODEL.is_file()
+        or YUNET_MODEL.stat().st_size <= 100000
+        or not hasattr(cv2, "FaceDetectorYN_create")
+    ):
+        _YUNET_DETECTOR_FAILED = True
+        return None
+    try:
+        _YUNET_DETECTOR = cv2.FaceDetectorYN_create(
+            str(YUNET_MODEL),
+            "",
+            (320, 320),
+            0.72,
+            0.3,
+            5000,
+        )
+    except Exception:
+        _YUNET_DETECTOR_FAILED = True
+        log_exception("Could not initialize YuNet detector")
+        return None
+    return _YUNET_DETECTOR
+
+
+def _get_haar_cascade() -> Any:
+    global _HAAR_CASCADE
+    if _HAAR_CASCADE is not None:
+        return _HAAR_CASCADE
+    cascade_path = (
+        Path(cv2.data.haarcascades)
+        / "haarcascade_frontalface_default.xml"
+    )
+    cascade = cv2.CascadeClassifier(str(cascade_path))
+    if cascade.empty():
+        return None
+    _HAAR_CASCADE = cascade
+    return _HAAR_CASCADE
+
+
 def _detect_yunet(image: np.ndarray) -> List[Dict[str, Any]]:
-    if not (YUNET_MODEL.is_file() and YUNET_MODEL.stat().st_size > 100000) or not hasattr(cv2, "FaceDetectorYN_create"):
+    detector = _get_yunet_detector()
+    if detector is None:
         return []
     h, w = image.shape[:2]
     detect_size = (320, 320)
@@ -352,7 +502,7 @@ def _detect_yunet(image: np.ndarray) -> List[Dict[str, Any]]:
     pad_y = (detect_size[1] - nh) // 2
     small[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
     try:
-        detector = cv2.FaceDetectorYN_create(str(YUNET_MODEL), "", detect_size, 0.72, 0.3, 5000)
+        detector.setInputSize(detect_size)
         _retval, faces = detector.detect(small)
     except Exception:
         log_exception("YuNet detection failed")
@@ -380,9 +530,8 @@ def _detect_yunet(image: np.ndarray) -> List[Dict[str, Any]]:
 
 def _detect_haar(image: np.ndarray) -> List[Dict[str, Any]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(str(cascade_path))
-    if cascade.empty():
+    cascade = _get_haar_cascade()
+    if cascade is None:
         return []
     faces = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(48, 48))
     results: List[Dict[str, Any]] = []
@@ -727,6 +876,81 @@ def analyze_face(image: np.ndarray) -> Dict[str, Any]:
         },
     }
 
+
+
+def evaluate_reference_quality(model: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize whether one measured face is a stable colour reference.
+
+    The preset is still created: this is a warning system, not another hidden
+    hard gate. It catches references that make a mathematically precise match
+    undesirable (clipping, very uneven cheeks, noisy skin, poor coverage).
+    """
+    zones = model.get("zones") or {}
+    pooled = model.get("pooled") or {}
+    quality = model.get("quality") or {}
+    face = model.get("face") or {}
+
+    anchors: List[Dict[str, Any]] = []
+    for zone in zones.values():
+        anchors.extend(zone.get("anchors") or [])
+
+    spreads = np.asarray([
+        float(item.get("spread", 0.0))
+        for item in anchors
+    ], dtype=np.float64)
+    median_spread = float(np.median(spreads)) if spreads.size else 0.0
+
+    clipped = 0
+    for item in anchors:
+        values = [
+            float(item.get("r", 0.0)),
+            float(item.get("g", 0.0)),
+            float(item.get("b", 0.0)),
+        ]
+        if min(values) <= 6.0 or max(values) >= 249.0:
+            clipped += 1
+    clipping_fraction = (
+        float(clipped) / float(len(anchors))
+        if anchors else 0.0
+    )
+
+    issues: List[str] = []
+    if len(zones) < 3:
+        issues.append("few_zones")
+    if int(pooled.get("pixels", 0) or 0) < 220:
+        issues.append("low_coverage")
+    if float(quality.get("score", 100.0) or 0.0) < 55.0:
+        issues.append("low_mask_quality")
+    cheek_de = quality.get("cheek_delta_e")
+    if cheek_de is not None and float(cheek_de) > 7.5:
+        issues.append("uneven_cheeks")
+    if median_spread > 16.0:
+        issues.append("high_spread")
+    if clipping_fraction > 0.10:
+        issues.append("clipping")
+    if not bool(face.get("normalized")):
+        issues.append("weak_geometry")
+
+    # Do not make a Haar fallback warning by itself look fatal. The status is
+    # intended to surface references that actually have measurement concerns.
+    substantive = [
+        item for item in issues if item != "weak_geometry"
+    ]
+    status = "warning" if substantive else "good"
+
+    return {
+        "status": status,
+        "issues": issues,
+        "zone_count": int(len(zones)),
+        "pooled_pixels": int(pooled.get("pixels", 0) or 0),
+        "mask_score": round(float(quality.get("score", 0.0) or 0.0), 1),
+        "cheek_delta_e": (
+            round(float(cheek_de), 3)
+            if cheek_de is not None else None
+        ),
+        "median_spread": round(median_spread, 3),
+        "clipping_fraction": round(clipping_fraction, 4),
+    }
 
 
 def _sample_rgb_pixels(rgb: np.ndarray, max_pixels: int = 180000) -> np.ndarray:
@@ -1714,7 +1938,10 @@ def _unit_ab_from_lab_array(labs: np.ndarray, fallback: Sequence[float]) -> np.n
     return out
 
 
-def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _fit_smooth_skin_model_once(
+    rows: List[Dict[str, Any]],
+    orthogonalize_lightness: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Smooth Lab base + weak local chroma RBF residual.
 
     v0.8.1 adds an explicit smooth chroma (saturation) correction. The model
@@ -1785,11 +2012,37 @@ def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     dc_raw = np.asarray([row[7] for row in grouped], dtype=np.float64)
     node_weights = np.asarray([row[8] for row in grouped], dtype=np.float64)
 
-    # Global Tone owns large L* changes. Skin Match keeps only the remaining
-    # smooth lightness mismatch.
+    # Global Tone owns the broad offset/slope of L*. When Tone was actually
+    # accepted, remove most of that low-order component from Skin Match so the
+    # two stages do not fight each other. Skin Match retains only a small
+    # smooth residual curvature.
+    removed_lightness_trend = np.zeros_like(dl_raw)
+    if orthogonalize_lightness and len(dl_raw) >= 3:
+        l_center = float(np.average(l_nodes, weights=node_weights))
+        l_scale = max(8.0, float(np.ptp(l_nodes)))
+        x = (l_nodes - l_center) / l_scale
+        design = np.column_stack([np.ones_like(x), x])
+        sw = np.sqrt(np.maximum(node_weights, 1e-6))
+        try:
+            coeff, *_ = np.linalg.lstsq(
+                design * sw[:, None],
+                dl_raw * sw,
+                rcond=None,
+            )
+            global_trend = design @ coeff
+            # Remove only half of the broad trend. The constrained Photoshop
+            # Tone curve may intentionally leave a useful residual, so Skin
+            # Match keeps the other half while avoiding a second full global
+            # tone correction.
+            removed_lightness_trend = 0.50 * global_trend
+            dl_raw = dl_raw - removed_lightness_trend
+        except np.linalg.LinAlgError:
+            pass
+
     dl = np.clip(
         _smooth_weighted_series(dl_raw, node_weights, 3.4),
-        -3.2, 3.2,
+        -2.8 if orthogonalize_lightness else -3.2,
+        2.8 if orthogonalize_lightness else 3.2,
     )
     dl = _limit_smooth_lightness_delta(
         l_nodes,
@@ -1881,6 +2134,8 @@ def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
         "l_high": float(np.percentile(src_lab[:, 0], 97.0) + 8.0),
         "rbf_sigma_l": 9.0,
         "rbf_sigma_ab": 11.5,
+        "orthogonalized_lightness": bool(orthogonalize_lightness),
+        "removed_lightness_trend": removed_lightness_trend,
     }
 
     # Fit the remaining full-Lab error around the smooth model. The explicit
@@ -1902,6 +2157,88 @@ def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     model["rbf_centers"] = src_lab
     model["rbf_residuals"] = rbf_residual
     return model
+
+
+def _fit_smooth_skin_model(
+    rows: List[Dict[str, Any]],
+    orthogonalize_lightness: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Fit once, then robustly downweight isolated bad correspondences once.
+
+    This is a single IRLS-style refinement, not an iterative optimizer. A
+    specular reflection or local colour contamination can no longer pull the
+    entire skin model as strongly, while coherent global differences keep
+    their full weight.
+    """
+    model = _fit_smooth_skin_model_once(
+        rows,
+        orthogonalize_lightness=orthogonalize_lightness,
+    )
+    if model is None or len(rows) < 10:
+        return model
+
+    # Detect outliers against the SMOOTH base, before the local RBF has a
+    # chance to explain them. This targets isolated reflections/contamination
+    # rather than systematically downweighting legitimate shadow/highlight
+    # rows where the safety gate intentionally attenuates the final LUT.
+    src_rgb = np.asarray([
+        [float(row["target"][k]) for k in ("r", "g", "b")]
+        for row in rows
+    ], dtype=np.float64)
+    ref_rgb = np.asarray([
+        [float(row["reference"][k]) for k in ("r", "g", "b")]
+        for row in rows
+    ], dtype=np.float64)
+    src_lab = _lab_array_from_rgb(src_rgb)
+    ref_lab = _lab_array_from_rgb(ref_rgb)
+    desired = ref_lab - src_lab
+    smooth_prediction = np.asarray([
+        _smooth_skin_base_delta_lab(lab, model)
+        for lab in src_lab
+    ], dtype=np.float64)
+    residual = np.sqrt(np.sum(
+        (desired - smooth_prediction) ** 2,
+        axis=1,
+    ))
+    if residual.size < 6:
+        return model
+
+    median = float(np.median(residual))
+    mad = float(np.median(np.abs(residual - median)))
+    robust_sigma = max(0.35, 1.4826 * mad)
+    cutoff = max(3.0, median + 2.50 * robust_sigma)
+
+    factors = np.ones_like(residual, dtype=np.float64)
+    high = residual > cutoff
+    if np.any(high):
+        factors[high] = np.clip(
+            cutoff / np.maximum(residual[high], 1e-6),
+            0.28,
+            1.0,
+        )
+
+    if float(np.min(factors)) >= 0.94:
+        model["robust_downweighted"] = 0
+        return model
+
+    robust_rows: List[Dict[str, Any]] = []
+    for row, factor in zip(rows, factors):
+        item = dict(row)
+        item["weight"] = max(
+            0.01,
+            float(row.get("weight", 1.0)) * float(factor),
+        )
+        robust_rows.append(item)
+
+    refined = _fit_smooth_skin_model_once(
+        robust_rows,
+        orthogonalize_lightness=orthogonalize_lightness,
+    )
+    if refined is None:
+        return model
+    refined["robust_downweighted"] = int(np.count_nonzero(factors < 0.94))
+    refined["robust_cutoff"] = float(cutoff)
+    return refined
 
 
 def _smooth_skin_base_delta_lab(
@@ -1994,18 +2331,25 @@ def _smooth_skin_gate(
 
     ab_delta = labv[1:3] - np.asarray(model["ab_center"], dtype=np.float64)
     mahal2 = float(ab_delta.T @ np.asarray(model["inv_cov"]) @ ab_delta)
-    gamut_gate = math.exp(-0.5 * mahal2 / (2.60 ** 2))
+    gamut_gate = math.exp(-0.5 * mahal2 / (2.70 ** 2))
 
     src_lab = np.asarray(model["src_lab"], dtype=np.float64)
     scaled = src_lab - labv.reshape(1, 3)
     scaled[:, 0] *= 0.70
     nearest = float(np.min(np.sqrt(np.sum(scaled ** 2, axis=1))))
-    nearest_gate = math.exp(-0.5 * (nearest / 21.0) ** 2)
+    nearest_gate = math.exp(-0.5 * (nearest / 22.0) ** 2)
 
     chroma = float(math.hypot(labv[1], labv[2]))
     neutral_gate = float(
-        _smoothstep(np.asarray([chroma]), 4.5, 13.0)[0]
+        _smoothstep(np.asarray([chroma]), 4.5, 12.5)[0]
     )
+
+    # One colour-membership confidence instead of repeatedly multiplying
+    # several similar colour-distance gates. This avoids unintended rapid
+    # attenuation on perfectly plausible neighbouring skin colours.
+    color_membership = math.sqrt(
+        max(0.0, gamut_gate) * max(0.0, nearest_gate)
+    ) * neutral_gate
 
     l_low = float(model["l_low"])
     l_high = float(model["l_high"])
@@ -2020,7 +2364,6 @@ def _smooth_skin_gate(
             )[0])
         )
     )
-
     shadow_gate = (
         0.12 * float(_smoothstep(np.asarray([labv[0]]), 18.0, 30.0)[0])
         + 0.88 * float(_smoothstep(np.asarray([labv[0]]), 30.0, 55.0)[0])
@@ -2028,18 +2371,17 @@ def _smooth_skin_gate(
     highlight_gate = 1.0 - 0.82 * float(
         _smoothstep(np.asarray([labv[0]]), 93.0, 99.5)[0]
     )
+    tonal_membership = min(
+        l_range_gate,
+        shadow_gate,
+        highlight_gate,
+    )
 
     return float(np.clip(
-        gamut_gate
-        * nearest_gate
-        * neutral_gate
-        * l_range_gate
-        * shadow_gate
-        * highlight_gate,
+        color_membership * tonal_membership,
         0.0,
         1.0,
     ))
-
 
 
 
@@ -2047,12 +2389,7 @@ def _smooth_skin_lightness_gate(
     lab: Sequence[float],
     model: Dict[str, Any],
 ) -> float:
-    """Broader, smoother membership gate used ONLY for ΔL*.
-
-    Chroma may safely fade quickly outside the measured skin gamut. Lightness
-    must not: a narrow L-range fade changes local contrast. Therefore ΔL* uses
-    broad colour membership plus only global deep-shadow / near-white fades.
-    """
+    """Broad membership for smooth residual ΔL*, never a local tone mask."""
     labv = np.asarray(lab, dtype=np.float64)
 
     ab_delta = (
@@ -2064,47 +2401,29 @@ def _smooth_skin_lightness_gate(
         @ np.asarray(model["inv_cov"], dtype=np.float64)
         @ ab_delta
     )
-    gamut_gate = math.exp(
-        -0.5 * mahal2 / (3.10 ** 2)
-    )
+    gamut_gate = math.exp(-0.5 * mahal2 / (3.25 ** 2))
 
-    src_lab = np.asarray(
-        model["src_lab"],
-        dtype=np.float64,
-    )
+    src_lab = np.asarray(model["src_lab"], dtype=np.float64)
     ab_distance = np.sqrt(np.sum(
         (src_lab[:, 1:3] - labv[1:3].reshape(1, 2)) ** 2,
         axis=1,
     ))
     nearest_ab = float(np.min(ab_distance))
-    nearest_gate = math.exp(
-        -0.5 * (nearest_ab / 18.0) ** 2
-    )
+    nearest_gate = math.exp(-0.5 * (nearest_ab / 19.0) ** 2)
 
     chroma = float(math.hypot(labv[1], labv[2]))
     neutral_gate = float(
-        _smoothstep(
-            np.asarray([chroma]),
-            4.5,
-            12.0,
-        )[0]
+        _smoothstep(np.asarray([chroma]), 4.5, 12.0)[0]
     )
+    color_membership = math.sqrt(
+        max(0.0, gamut_gate) * max(0.0, nearest_gate)
+    ) * neutral_gate
 
     shadow_gate = float(
-        _smoothstep(
-            np.asarray([labv[0]]),
-            22.0,
-            44.0,
-        )[0]
+        _smoothstep(np.asarray([labv[0]]), 22.0, 44.0)[0]
     )
-    # Do not fade the smooth ΔL* field over a short near-white interval.
-    # That fade can itself compress facial highlight contrast. Normal skin is
-    # well below L*=100; final RGB clipping still protects the absolute white.
     return float(np.clip(
-        gamut_gate
-        * nearest_gate
-        * neutral_gate
-        * shadow_gate,
+        color_membership * shadow_gate,
         0.0,
         1.0,
     ))
@@ -2206,6 +2525,7 @@ def _stratified_skin_folds(
 def _skin_cross_validation_scores(
     rows: List[Dict[str, Any]],
     strengths: Sequence[float],
+    orthogonalize_lightness: bool = False,
 ) -> Dict[float, float]:
     totals = {float(s): [0.0, 0.0] for s in strengths}
     folds = _stratified_skin_folds(rows, 3)
@@ -2222,7 +2542,10 @@ def _skin_cross_validation_scores(
         if len(train) < 6 or len(held) < 2:
             continue
 
-        model = _fit_smooth_skin_model(train)
+        model = _fit_smooth_skin_model(
+            train,
+            orthogonalize_lightness=orthogonalize_lightness,
+        )
         if model is None:
             continue
         valid_folds += 1
@@ -2242,7 +2565,10 @@ def _skin_cross_validation_scores(
             totals[float(strength)][1] += float(np.sum(weights))
 
     if valid_folds < 2:
-        model = _fit_smooth_skin_model(rows)
+        model = _fit_smooth_skin_model(
+            rows,
+            orthogonalize_lightness=orthogonalize_lightness,
+        )
         if model is None:
             baseline = _rows_delta_e_identity(rows)
             return {float(s): baseline for s in strengths}
@@ -2339,6 +2665,7 @@ def _choose_smooth_skin_strength(
     minimum_gain: float,
     collateral_pixels: Optional[np.ndarray] = None,
     protection_bias: float = 0.0,
+    orthogonalize_lightness: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
     """Choose strength using the actual exported LUT, not the continuous model."""
     baseline = float(_rows_delta_e_identity(rows))
@@ -2360,6 +2687,7 @@ def _choose_smooth_skin_strength(
     cv_scores = _skin_cross_validation_scores(
         rows,
         (0.0,) + strengths,
+        orthogonalize_lightness=orthogonalize_lightness,
     )
     cv_baseline = float(cv_scores.get(0.0, baseline))
 
@@ -2587,20 +2915,24 @@ def _smooth_skin_delta_lab_array(
             inv_cov,
             ab_delta,
         )
-        gamut_gate = np.exp(-0.5 * mahal2 / (2.60 ** 2))
+        gamut_gate = np.exp(-0.5 * mahal2 / (2.70 ** 2))
 
         nearest2 = np.min(
             (0.70 * dl) ** 2 + da ** 2 + db ** 2,
             axis=1,
         )
         nearest_gate = np.exp(
-            -0.5 * nearest2 / (21.0 ** 2)
+            -0.5 * nearest2 / (22.0 ** 2)
         )
 
         chroma = np.sqrt(
             lab[:, 1] ** 2 + lab[:, 2] ** 2
         )
-        neutral_gate = _smoothstep(chroma, 4.5, 13.0)
+        neutral_gate = _smoothstep(chroma, 4.5, 12.5)
+        color_membership = (
+            np.sqrt(np.maximum(0.0, gamut_gate * nearest_gate))
+            * neutral_gate
+        )
 
         l_range_gate = (
             _smoothstep(lab[:, 0], l_low, l_low + 9.0)
@@ -2621,34 +2953,37 @@ def _smooth_skin_delta_lab_array(
             1.0
             - 0.82 * _smoothstep(lab[:, 0], 93.0, 99.5)
         )
+        tonal_membership = np.minimum(
+            l_range_gate,
+            np.minimum(shadow_gate, highlight_gate),
+        )
         chroma_gate = np.clip(
-            gamut_gate
-            * nearest_gate
-            * neutral_gate
-            * l_range_gate
-            * shadow_gate
-            * highlight_gate,
+            color_membership * tonal_membership,
             0.0,
             1.0,
         )
 
-        # ΔL* needs a much broader tonal gate. A narrow fade near the measured
-        # skin L-range can compress highlights or lift shadows even when the
-        # fitted ΔL* function itself is perfectly smooth.
         gamut_gate_l = np.exp(
-            -0.5 * mahal2 / (3.10 ** 2)
+            -0.5 * mahal2 / (3.25 ** 2)
         )
         nearest_ab2 = np.min(
             da ** 2 + db ** 2,
             axis=1,
         )
         nearest_gate_l = np.exp(
-            -0.5 * nearest_ab2 / (18.0 ** 2)
+            -0.5 * nearest_ab2 / (19.0 ** 2)
         )
         neutral_gate_l = _smoothstep(
             chroma,
             4.5,
             12.0,
+        )
+        color_membership_l = (
+            np.sqrt(np.maximum(
+                0.0,
+                gamut_gate_l * nearest_gate_l,
+            ))
+            * neutral_gate_l
         )
         shadow_gate_l = _smoothstep(
             lab[:, 0],
@@ -2656,10 +2991,7 @@ def _smooth_skin_delta_lab_array(
             44.0,
         )
         lightness_gate = np.clip(
-            gamut_gate_l
-            * nearest_gate_l
-            * neutral_gate_l
-            * shadow_gate_l,
+            color_membership_l * shadow_gate_l,
             0.0,
             1.0,
         )
@@ -3375,7 +3707,11 @@ def fit_smooth_match(
         "collateral_p99": 0.0,
     }
 
-    skin_model = _fit_smooth_skin_model(tone_rows)
+    orthogonalize_skin_lightness = bool(tone_curves)
+    skin_model = _fit_smooth_skin_model(
+        tone_rows,
+        orthogonalize_lightness=orthogonalize_skin_lightness,
+    )
     if skin_model is not None:
         base_lut = _build_smooth_skin_lut(
             skin_model,
@@ -3389,6 +3725,7 @@ def fit_smooth_match(
             minimum_gain,
             collateral_prepared,
             protection_bias,
+            orthogonalize_lightness=orthogonalize_skin_lightness,
         )
 
         if skin_strength > 0.0:
@@ -3654,6 +3991,14 @@ def fit_smooth_match(
             1,
         ),
         "correspondences": len(rows),
+        "skin_robust_downweighted": int(
+            skin_model.get("robust_downweighted", 0)
+            if skin_model is not None else 0
+        ),
+        "skin_lightness_orthogonalized": bool(
+            skin_model.get("orthogonalized_lightness", False)
+            if skin_model is not None else False
+        ),
         "strategy": "unified",
     }
 
@@ -3800,8 +4145,9 @@ def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, 
         raise ApiError("Image path and preset folder are required.", "INVALID_ARGUMENT")
     folder.mkdir(parents=True, exist_ok=True)
     preview_size = int(message.get("preview_size", 1400) or 1400)
-    image = prepare_analysis_image(imread_unicode(image_path), preview_size)
+    image = imread_analysis_unicode(image_path, preview_size)
     model = analyze_face(image)
+    reference_quality = evaluate_reference_quality(model)
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
     if update:
@@ -3809,6 +4155,7 @@ def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, 
         path, old = resolve_preset(str(folder), preset_id, str(message.get("preset_path") or ""))
         data = old
         data["reference_model"] = model
+        data["reference_quality"] = reference_quality
         data["algorithm_version"] = VERSION
         data["updated_at"] = now
         data["source"] = {
@@ -3817,7 +4164,11 @@ def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, 
             "preview_size": [int(image.shape[1]), int(image.shape[0])],
         }
         atomic_json_write(path, data)
-        return {"preset": preset_summary(path, data), "face": model["face"]}
+        return {
+            "preset": preset_summary(path, data),
+            "face": model["face"],
+            "reference_quality": reference_quality,
+        }
 
     name = str(message.get("name") or "Preset").strip() or "Preset"
     preset_id = uuid.uuid4().hex
@@ -3836,9 +4187,14 @@ def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, 
             "preview_size": [int(image.shape[1]), int(image.shape[0])],
         },
         "reference_model": model,
+        "reference_quality": reference_quality,
     }
     atomic_json_write(path, data)
-    return {"preset": preset_summary(path, data), "face": model["face"]}
+    return {
+        "preset": preset_summary(path, data),
+        "face": model["face"],
+        "reference_quality": reference_quality,
+    }
 
 
 def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -3846,17 +4202,14 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
     preset_folder = str(message.get("preset_folder") or "")
     preset_id = str(message.get("preset_id") or "")
     preset_path = str(message.get("preset_path") or "")
-    minimum_gain = float(
-        message.get("minimum_gain", 0.1) or 0.0
-    )
-    minimum_gain = float(np.clip(minimum_gain, 0.0, 2.0))
+    minimum_gain = MINIMUM_STAGE_GAIN
 
     preview_size = int(message.get("preview_size", 1400) or 1400)
     lightness_balance = float(message.get("lightness_balance", 0.0) or 0.0)
     protection_bias = float(message.get("protection_bias", 0.0) or 0.0)
 
     path, preset = resolve_preset(preset_folder, preset_id, preset_path)
-    image = prepare_analysis_image(imread_unicode(image_path), preview_size)
+    image = imread_analysis_unicode(image_path, preview_size)
     target_model = analyze_face(image)
     rows = build_correspondences(
         target_model, preset["reference_model"]

@@ -8,7 +8,6 @@
     /Events <<
         /db558f66-6e38-41e7-a274-70537f4632af [(Face Color Match) <<
             /selectedPresetId [(preset id) /string]
-            /minimumGain [(minimum Delta E gain) /double]
             /strength [(strength) /integer]
             /lightnessBalance [(lightness balance) /integer]
             /protectionBias [(accuracy safety balance) /integer]
@@ -35,15 +34,14 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.9.5",
+            version: "0.10.0",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
             apiPortListen: 42972,
             apiProtocol: 1,
-            settingsFolder: "Boogalooper/Face Color Match",
-            settingsFile: "settings.json",
+            settingsFile: "Face Color Match settings.json",
             startupFile: "face-color-match-startup.json",
             launchFile: "face-color-match-launch.json",
             logFile: "face-color-match.log"
@@ -355,6 +353,7 @@ function faceColorMatchApplyHistory() {
                     });
                 });
                 refreshPresets(result && result.preset ? result.preset.id : "");
+                showReferenceQualityWarning(result);
             } catch (e) { alert(errorText(e), APP.name, true); }
         };
 
@@ -371,6 +370,7 @@ function faceColorMatchApplyHistory() {
                     });
                 });
                 refreshPresets(result && result.preset ? result.preset.id : item.id);
+                showReferenceQualityWarning(result);
             } catch (e) { alert(errorText(e), APP.name, true); }
         };
 
@@ -405,6 +405,33 @@ function faceColorMatchApplyHistory() {
             : { cancelled: true };
     }
 
+    function showReferenceQualityWarning(result) {
+        var quality = result && result.reference_quality
+                ? result.reference_quality
+                : null,
+            issues = quality && quality.issues instanceof Array
+                ? quality.issues
+                : [],
+            messages = [],
+            i, code, key;
+
+        if (!quality || quality.status != "warning") return;
+
+        for (i = 0; i < issues.length; i++) {
+            code = String(issues[i] || "");
+            if (code == "weak_geometry") continue;
+            key = "referenceIssue_" + code;
+            if (str[key]) messages.push("• " + str[key]);
+        }
+        if (!messages.length) return;
+
+        alert(
+            str.referenceQualityWarning + "\n\n" + messages.join("\n"),
+            APP.name,
+            false
+        );
+    }
+
     function settingsDialog() {
         var temp = cloneObject(cfg.data),
             w = ui.createDialog(str.settings),
@@ -420,7 +447,6 @@ function faceColorMatchApplyHistory() {
             layerRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             layerLabel = layerRow.add("statictext", undefined, str.layerName),
             layerEdit = layerRow.add("edittext", undefined, temp.layerName),
-            info = pGeneral.add("statictext", undefined, str.serverInfo, { multiline: true }),
             buttons = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10}"),
             ok = buttons.add("button", undefined, str.ok, { name: "ok" }),
             cancel = buttons.add("button", undefined, str.cancel, { name: "cancel" });
@@ -434,7 +460,6 @@ function faceColorMatchApplyHistory() {
         ui.setFixedWidth(folderButton, 30);
         ui.setFixedWidth(previewEdit, 80);
         ui.setFixedWidth(layerEdit, 220);
-        ui.setFixedWidth(info, 455);
 
         skip.value = !!temp.skipNoFace;
 
@@ -999,7 +1024,6 @@ function faceColorMatchApplyHistory() {
                 image_path: imagePath,
                 preset_folder: data.presetFolder,
                 preset_id: data.selectedPresetId,
-                minimum_gain: Number(data.minimumGain),
                 preview_size: parseInt(data.previewSize, 10) || 1400,
                 lightness_balance: parseInt(data.lightnessBalance, 10) || 0,
                 protection_bias: parseInt(data.protectionBias, 10) || 0
@@ -1100,16 +1124,13 @@ function faceColorMatchApplyHistory() {
     // ---
     function ActionRuntime() {
         function actionData() {
-            var gain = Number(cfg.data.minimumGain),
-                strength = Number(cfg.data.strength);
+            var strength = Number(cfg.data.strength);
 
-            if (isNaN(gain)) gain = 0.1;
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 7,
+                actionDataVersion: 8,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
-                minimumGain: gain,
                 strength: Math.round(strength),
                 lightnessBalance: Math.round(Number(cfg.data.lightnessBalance) || 0),
                 protectionBias: Math.round(Number(cfg.data.protectionBias) || 0),
@@ -1159,8 +1180,6 @@ function faceColorMatchApplyHistory() {
 
             if (values.selectedPresetId !== undefined)
                 cfg.data.selectedPresetId = String(values.selectedPresetId || "");
-            if (values.minimumGain !== undefined)
-                cfg.data.minimumGain = Number(values.minimumGain);
             if (values.strength !== undefined)
                 cfg.data.strength = Number(values.strength);
             if (values.lightnessBalance !== undefined)
@@ -1330,65 +1349,70 @@ function faceColorMatchApplyHistory() {
     }
 
     function Config() {
+        var SETTINGS_VERSION = 9;
         this.data = defaults();
 
         this.load = function () {
             var file = settingsFile(),
-                backup = new File(file.fsName + ".bak"),
-                loaded = null,
-                key;
+                loaded = null;
 
-            if (file.exists) {
-                try { loaded = jsonParse(readTextFile(file)); }
-                catch (_) { loaded = null; }
-            }
-            if ((!loaded || typeof loaded != "object") && backup.exists) {
-                try { loaded = jsonParse(readTextFile(backup)); }
-                catch (_) { loaded = null; }
-            }
-            if (!loaded || typeof loaded != "object") return;
+            if (!file.exists) return;
 
-            for (key in loaded) {
-                if (
-                    loaded.hasOwnProperty(key)
-                    && this.data.hasOwnProperty(key)
-                ) this.data[key] = loaded[key];
+            try {
+                loaded = jsonParse(readTextFile(file));
+            } catch (_) {
+                return;
             }
 
-            this.data.settingsVersion = 7;
+            // No settings migration or compatibility layer. A settings file
+            // from another schema version is simply ignored and fresh defaults
+            // are used.
+            if (
+                !loaded ||
+                typeof loaded != "object" ||
+                Number(loaded.settingsVersion) !== SETTINGS_VERSION
+            ) return;
+
+            if (
+                loaded.presetFolder === undefined ||
+                loaded.selectedPresetId === undefined ||
+                loaded.previewSize === undefined ||
+                loaded.strength === undefined ||
+                loaded.lightnessBalance === undefined ||
+                loaded.protectionBias === undefined ||
+                loaded.layerName === undefined ||
+                loaded.skipNoFace === undefined
+            ) return;
+
+            this.data = loaded;
             normalize(this.data);
         };
 
         this.save = function () {
             normalize(this.data);
-            var folder = settingsFolder(),
-                file = settingsFile(),
-                backup = new File(file.fsName + ".bak");
-
-            if (!ensureFolder(folder))
-                throw new Error(str.settingsWriteError + "\n" + folder.fsName);
-
-            if (file.exists) {
-                try { if (backup.exists) backup.remove(); } catch (_) { }
-                try { file.copy(backup.fsName); } catch (_) { }
-            }
-            writeTextFile(file, jsonStringify(this.data));
+            writeTextFile(settingsFile(), jsonStringify(this.data));
         };
 
         this.ensurePresetFolder = function () {
             var folder = new Folder(this.data.presetFolder);
-            ensureFolder(folder);
+            if (!ensureFolder(folder))
+                throw new Error(
+                    str.settingsWriteError + "\n" + folder.fsName
+                );
         };
+
+        function defaultPresetFolder() {
+            return new Folder(
+                app.preferencesFolder + "/Face Color Match Presets"
+            ).fsName;
+        }
 
         function defaults() {
             return {
-                presetFolder: (new Folder(
-                    Folder.myDocuments.fsName + "/Face Color Match Presets"
-                )).fsName,
+                presetFolder: defaultPresetFolder(),
                 selectedPresetId: "",
                 previewSize: 1400,
-                settingsVersion: 7,
-                minimumGain: 0.1,
+                settingsVersion: SETTINGS_VERSION,
                 strength: 100,
                 lightnessBalance: 0,
                 protectionBias: 0,
@@ -1398,25 +1422,20 @@ function faceColorMatchApplyHistory() {
         }
 
         function normalize(d) {
-            var defaultFolder = (new Folder(
-                    Folder.myDocuments.fsName + "/Face Color Match Presets"
-                )).fsName,
-                gain = Number(d.minimumGain),
-                strengthValue = Number(d.strength);
+            var strengthValue = Number(d.strength);
 
-            d.presetFolder = normalizeFolderPath(d.presetFolder || defaultFolder);
+            d.presetFolder = normalizeFolderPath(
+                d.presetFolder || defaultPresetFolder()
+            );
             d.selectedPresetId = String(d.selectedPresetId || "");
             d.previewSize = Math.max(
                 640,
-                Math.min(3000, parseInt(d.previewSize, 10) || 1400)
+                Math.min(
+                    3000,
+                    parseInt(d.previewSize, 10) || 1400
+                )
             );
-            d.settingsVersion = 7;
-
-            if (isNaN(gain)) gain = 0.1;
-            d.minimumGain = Math.max(
-                0,
-                Math.min(2, Math.round(gain * 10) / 10)
-            );
+            d.settingsVersion = SETTINGS_VERSION;
 
             if (isNaN(strengthValue)) strengthValue = 100;
             d.strength = Math.max(
@@ -1424,17 +1443,30 @@ function faceColorMatchApplyHistory() {
                 Math.min(100, Math.round(strengthValue))
             );
 
-            d.layerName = String(d.layerName || "Face Color Match");
-            d.lightnessBalance = Math.max(-100, Math.min(100, Math.round(Number(d.lightnessBalance) || 0)));
-            d.protectionBias = Math.max(-100, Math.min(100, Math.round(Number(d.protectionBias) || 0)));
+            d.layerName = String(
+                d.layerName || "Face Color Match"
+            );
+            d.lightnessBalance = Math.max(
+                -100,
+                Math.min(
+                    100,
+                    Math.round(Number(d.lightnessBalance) || 0)
+                )
+            );
+            d.protectionBias = Math.max(
+                -100,
+                Math.min(
+                    100,
+                    Math.round(Number(d.protectionBias) || 0)
+                )
+            );
             d.skipNoFace = !!d.skipNoFace;
         }
 
-        function settingsFolder() {
-            return new Folder(Folder.userData.fsName + "/" + APP.settingsFolder);
-        }
         function settingsFile() {
-            return new File(settingsFolder().fsName + "/" + APP.settingsFile);
+            return new File(
+                app.preferencesFolder + "/" + APP.settingsFile
+            );
         }
     }
 
@@ -1448,7 +1480,6 @@ function faceColorMatchApplyHistory() {
                 noDocument: "Нет открытого документа.",
                 preset: "Пресет",
                 strength: "Сила",
-                minimumGain: "Мин. улучшение ΔE",
                 lightnessBalance: "Тени / света",
                 protectionBias: "Точность / защита",
                 apply: "Применить",
@@ -1463,6 +1494,13 @@ function faceColorMatchApplyHistory() {
                 updatePresetHelp: "Обновить выбранный пресет из текущего документа",
                 presetNamePrompt: "Имя нового пресета:",
                 updatePresetConfirm: "Обновить пресет «%s» по текущему документу?",
+                referenceQualityWarning: "Образец сохранён, но его цвет может быть нестабильным для точного совпадения:",
+                referenceIssue_few_zones: "мало надёжно измеренных зон кожи",
+                referenceIssue_low_coverage: "слишком мало пригодных пикселей кожи",
+                referenceIssue_low_mask_quality: "низкая уверенность маски кожи",
+                referenceIssue_uneven_cheeks: "левая и правая щека заметно различаются по цвету",
+                referenceIssue_high_spread: "в измерениях кожи слишком большой разброс",
+                referenceIssue_clipping: "часть измерений близка к клиппингу каналов",
                 progressStartServer: "Запуск локального сервера...",
                 progressRestartServer: "Перезапуск локального сервера...",
                 progressPrepareServer: "Подготовка запуска Python...",
@@ -1481,7 +1519,6 @@ function faceColorMatchApplyHistory() {
                 skipNoFace: "Пропускать изображение, если лицо не найдено",
                 layerName: "Имя слоя",
                 general: "Общие настройки",
-                serverInfo: "Фоновый сервис запускается автоматически и выключается через 30 минут бездействия.",
                 selectPresetFolder: "Выберите папку пресетов",
                 folderRequired: "Укажите папку пресетов.",
                 noPresetSelected: "Не выбран пресет образца.",
@@ -1508,7 +1545,6 @@ function faceColorMatchApplyHistory() {
                 noDocument: "No document is open.",
                 preset: "Preset",
                 strength: "Strength",
-                minimumGain: "Min. ΔE improvement",
                 lightnessBalance: "Shadows / highlights",
                 protectionBias: "Accuracy / safety",
                 apply: "Apply",
@@ -1523,6 +1559,13 @@ function faceColorMatchApplyHistory() {
                 updatePresetHelp: "Update the selected preset from the current document",
                 presetNamePrompt: "New preset name:",
                 updatePresetConfirm: "Update preset “%s” from the current document?",
+                referenceQualityWarning: "The reference was saved, but its color may be unstable for precise matching:",
+                referenceIssue_few_zones: "too few reliable skin zones were measured",
+                referenceIssue_low_coverage: "too few usable skin pixels",
+                referenceIssue_low_mask_quality: "low skin-mask confidence",
+                referenceIssue_uneven_cheeks: "left and right cheek colors differ substantially",
+                referenceIssue_high_spread: "skin measurements have excessive spread",
+                referenceIssue_clipping: "some measurements are close to channel clipping",
                 progressStartServer: "Starting local server...",
                 progressRestartServer: "Restarting local server...",
                 progressPrepareServer: "Preparing Python launch...",
@@ -1541,7 +1584,6 @@ function faceColorMatchApplyHistory() {
                 skipNoFace: "Skip image when no face is found",
                 layerName: "Layer name",
                 general: "General settings",
-                serverInfo: "The background service starts automatically and exits after 30 minutes of inactivity.",
                 selectPresetFolder: "Select preset folder",
                 folderRequired: "Select a preset folder.",
                 noPresetSelected: "No reference preset is selected.",
