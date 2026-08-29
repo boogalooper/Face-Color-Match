@@ -1,0 +1,247 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (optional; by default read from JSX/Python)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and verify version
+        id: release
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          JSX_FILE="Face Color Match.jsx"
+          PY_FILE="lib/face-color-api.pyw"
+
+          JSX_VERSION="$(
+            sed -nE 's/^[[:space:]]*version:[[:space:]]*"([^"]+)".*/\1/p' \
+              "${JSX_FILE}" | head -n 1
+          )"
+
+          PY_VERSION="$(
+            sed -nE 's/^VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+              "${PY_FILE}" | head -n 1
+          )"
+
+          if [ -z "${JSX_VERSION}" ]; then
+            echo "Cannot read version from ${JSX_FILE}"
+            exit 1
+          fi
+
+          if [ -z "${PY_VERSION}" ]; then
+            echo "Cannot read VERSION from ${PY_FILE}"
+            exit 1
+          fi
+
+          if [ "${JSX_VERSION}" != "${PY_VERSION}" ]; then
+            echo "Version mismatch:"
+            echo "  JSX:    ${JSX_VERSION}"
+            echo "  Python: ${PY_VERSION}"
+            exit 1
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="${INPUT_VERSION#v}"
+            if [ -z "${VERSION}" ]; then
+              VERSION="${JSX_VERSION}"
+            fi
+            TAG="v${VERSION}"
+          fi
+
+          if ! [[ "${VERSION}" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+            echo "Invalid version: ${VERSION}"
+            exit 1
+          fi
+
+          if [ "${VERSION}" != "${JSX_VERSION}" ]; then
+            echo "Release version ${VERSION} does not match source version ${JSX_VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("lib/face-color-api.pyw")
+          source = path.read_text(encoding="utf-8")
+          compile(source, str(path), "exec")
+          print("Python syntax OK")
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Face Color Match.jsx")
+          data = path.read_bytes()
+
+          if not data.startswith(b"\xef\xbb\xbf"):
+              raise SystemExit("Face Color Match.jsx must be UTF-8 with BOM")
+
+          text = data.decode("utf-8-sig")
+          lines = text.splitlines()
+
+          if lines and lines[0].lstrip().startswith("#target"):
+              lines = lines[1:]
+
+          Path("/tmp/face-color-match-check.js").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+          node --check /tmp/face-color-match-check.js
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("install.bat")
+          data = path.read_bytes()
+
+          if data.startswith(b"\xef\xbb\xbf"):
+              raise SystemExit("install.bat must be UTF-8 without BOM")
+
+          if b"\r\n" not in data:
+              raise SystemExit("install.bat must use CRLF line endings")
+
+          print("JSX and BAT checks OK")
+          PY
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="Face-Color-Match-${VERSION}"
+          PACKAGE_DIR="dist/${PACKAGE_NAME}"
+
+          rm -rf dist
+          mkdir -p "${PACKAGE_DIR}"
+
+          cp "Face Color Match.jsx" "${PACKAGE_DIR}/"
+          cp "README.md" "${PACKAGE_DIR}/"
+          cp "install.bat" "${PACKAGE_DIR}/"
+          cp -R "lib" "${PACKAGE_DIR}/"
+
+          find "${PACKAGE_DIR}" \
+            -type d -name "__pycache__" \
+            -prune -exec rm -rf {} +
+
+          find "${PACKAGE_DIR}" \
+            -type f \( -name "*.pyc" -o -name "*.pyo" \) \
+            -delete
+
+          # The release intentionally contains only the common installer.
+          rm -f \
+            "${PACKAGE_DIR}/install_python311.bat" \
+            "${PACKAGE_DIR}/install_python314.bat"
+
+          cd dist
+          zip -r "${PACKAGE_NAME}.zip" "${PACKAGE_NAME}"
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_TAG="$(
+            gh release list \
+              --exclude-drafts \
+              --exclude-pre-releases \
+              --limit 1 \
+              --json tagName \
+              --jq '.[0].tagName // empty'
+          )"
+
+          {
+            echo "## История изменений"
+            echo
+
+            if [ -n "${PREVIOUS_TAG}" ]; then
+              echo "Изменения с ${PREVIOUS_TAG}:"
+              echo
+              git log "${PREVIOUS_TAG}..${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            else
+              git log "${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            fi
+          } > release-notes.md
+
+          echo "Release notes:"
+          cat release-notes.md
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="dist/Face-Color-Match-${VERSION}.zip"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists"
+            exit 1
+          fi
+
+          if git rev-parse "${TAG}^{commit}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              "${ARCHIVE}" \
+              --verify-tag \
+              --title "Face Color Match ${VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "${TAG}" \
+              "${ARCHIVE}" \
+              --target "${GITHUB_SHA}" \
+              --title "Face Color Match ${VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          fi

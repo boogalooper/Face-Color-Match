@@ -34,7 +34,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.10.0",
+            version: "0.11.1",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -360,16 +360,29 @@ function faceColorMatchApplyHistory() {
         bUpdate.onClick = function () {
             var item = selectedPreset();
             if (!item) return;
-            if (!confirm(str.updatePresetConfirm.replace("%s", item.name || ""))) return;
+            var updateMode = choosePresetUpdateMode(item);
+            if (!updateMode) return;
             try {
                 var result = ui.progress(str.progressMeasureReference, function (setProgress) {
                     setProgress(str.progressPreparePreview, 20);
                     return withPreview(function (file) {
                         setProgress(str.progressMeasureReference, 55);
-                        return api.updatePreset(file.fsName, cfg.data.presetFolder, item.id, item.path, app.activeDocument.name, cfg.data.previewSize);
+                        return api.updatePreset(
+                            file.fsName,
+                            cfg.data.presetFolder,
+                            item.id,
+                            item.path,
+                            app.activeDocument.name,
+                            cfg.data.previewSize,
+                            updateMode
+                        );
                     });
                 });
-                refreshPresets(result && result.preset ? result.preset.id : item.id);
+                refreshPresets(
+                    result && result.preset
+                        ? result.preset.id
+                        : item.id
+                );
                 showReferenceQualityWarning(result);
             } catch (e) { alert(errorText(e), APP.name, true); }
         };
@@ -405,10 +418,74 @@ function faceColorMatchApplyHistory() {
             : { cancelled: true };
     }
 
+    function choosePresetUpdateMode(item) {
+        var count = Math.max(
+                1,
+                parseInt(item && item.reference_count, 10) || 1
+            ),
+            message = String(str.updatePresetPrompt)
+                .replace("%s", String(item && item.name || ""))
+                .replace("%n", String(count)),
+            w = ui.createDialog(str.updatePresetTitle),
+            info = w.add(
+                "statictext",
+                undefined,
+                message,
+                { multiline: true }
+            ),
+            buttons = w.add(
+                "group{orientation:'row',alignChildren:['center','center'],spacing:8}"
+            ),
+            addAverage = buttons.add(
+                "button",
+                undefined,
+                str.updatePresetAverage,
+                { name: "ok" }
+            ),
+            replace = buttons.add(
+                "button",
+                undefined,
+                str.updatePresetReplace
+            ),
+            cancel = buttons.add(
+                "button",
+                undefined,
+                str.cancel,
+                { name: "cancel" }
+            ),
+            result = null;
+
+        ui.setFixedWidth(info, 430);
+        addAverage.helpTip = str.updatePresetAverageHelp;
+        replace.helpTip = str.updatePresetReplaceHelp;
+
+        addAverage.onClick = function () {
+            result = "average";
+            w.close(1);
+        };
+        replace.onClick = function () {
+            result = "replace";
+            w.close(1);
+        };
+        cancel.onClick = function () {
+            result = null;
+            w.close(0);
+        };
+
+        ui.showDialog(w);
+        return result;
+    }
+
     function showReferenceQualityWarning(result) {
-        var quality = result && result.reference_quality
+        var sampleQuality = result && result.sample_quality
+                ? result.sample_quality
+                : null,
+            aggregateQuality = result && result.reference_quality
                 ? result.reference_quality
                 : null,
+            quality = (
+                sampleQuality && sampleQuality.status == "warning"
+            ) ? sampleQuality : aggregateQuality,
             issues = quality && quality.issues instanceof Array
                 ? quality.issues
                 : [],
@@ -1006,14 +1083,15 @@ function faceColorMatchApplyHistory() {
                 preview_size: parseInt(previewSize, 10) || 1400
             }, 45000);
         };
-        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName, previewSize) {
+        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName, previewSize, updateMode) {
             return call("update_preset", {
                 image_path: imagePath,
                 preset_folder: folder,
                 preset_id: presetId,
                 preset_path: presetPath,
                 source_name: sourceName,
-                preview_size: parseInt(previewSize, 10) || 1400
+                preview_size: parseInt(previewSize, 10) || 1400,
+                update_mode: String(updateMode || "replace")
             }, 45000);
         };
         this.deletePreset = function (folder, presetId, presetPath) {
@@ -1491,9 +1569,14 @@ function faceColorMatchApplyHistory() {
                 lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
                 protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. В сторону «Точность» алгоритм ослабляет часть защитных порогов и может проверить Skin Match до 120% расчётной силы, но оставляет только реально улучшающий и не катастрофический вариант. В сторону «Защита» максимальная сила Skin Match плавно снижается до 60%, усиливается защита фона и ограничивается внутренняя доводка.",
                 historyApplyMatch: "Face Color Match",
-                updatePresetHelp: "Обновить выбранный пресет из текущего документа",
+                updatePresetHelp: "Измерить текущий документ: добавить его к усреднённому эталону или полностью заменить эталон",
                 presetNamePrompt: "Имя нового пресета:",
-                updatePresetConfirm: "Обновить пресет «%s» по текущему документу?",
+                updatePresetTitle: "Обновить эталон",
+                updatePresetPrompt: "Пресет «%s» сейчас содержит %n эталонных измерений.\n\nДобавить текущий документ к эталону и пересчитать среднее значение или полностью заменить эталон текущим документом?",
+                updatePresetAverage: "Добавить и усреднить",
+                updatePresetReplace: "Заменить",
+                updatePresetAverageHelp: "Текущий документ станет ещё одним равноправным эталоном; соответствующие измерения кожи будут усреднены в Lab.",
+                updatePresetReplaceHelp: "Удалить накопленное усреднение и сделать текущий документ единственным эталоном.",
                 referenceQualityWarning: "Образец сохранён, но его цвет может быть нестабильным для точного совпадения:",
                 referenceIssue_few_zones: "мало надёжно измеренных зон кожи",
                 referenceIssue_low_coverage: "слишком мало пригодных пикселей кожи",
@@ -1556,9 +1639,14 @@ function faceColorMatchApplyHistory() {
                 lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
                 protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Toward Accuracy some safety thresholds are relaxed and the script may test Skin Match up to 120% of the fitted strength, keeping it only when measured skin ΔE genuinely improves without catastrophic spill. Toward Safety the maximum Skin Match strength falls progressively to 60%, background protection becomes stricter, and internal refinement is limited.",
                 historyApplyMatch: "Face Color Match",
-                updatePresetHelp: "Update the selected preset from the current document",
+                updatePresetHelp: "Measure the current document: add it to the averaged reference or replace the reference completely",
                 presetNamePrompt: "New preset name:",
-                updatePresetConfirm: "Update preset “%s” from the current document?",
+                updatePresetTitle: "Update reference",
+                updatePresetPrompt: "Preset “%s” currently contains %n reference measurements.\n\nAdd the current document as another reference and recalculate the average, or replace the reference completely with the current document?",
+                updatePresetAverage: "Add and average",
+                updatePresetReplace: "Replace",
+                updatePresetAverageHelp: "The current document becomes another equally weighted reference; corresponding skin measurements are averaged in Lab.",
+                updatePresetReplaceHelp: "Discard the accumulated average and make the current document the only reference.",
                 referenceQualityWarning: "The reference was saved, but its color may be unstable for precise matching:",
                 referenceIssue_few_zones: "too few reliable skin zones were measured",
                 referenceIssue_low_coverage: "too few usable skin pixels",

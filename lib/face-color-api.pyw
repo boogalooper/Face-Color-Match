@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.10.0"
+VERSION = "0.11.1"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -1190,14 +1190,38 @@ def _white_balance_curves(target_model: Dict[str, Any], wb: Optional[Dict[str, A
     }
 
 
+def _reference_lab_from_anchor(
+    anchor: Dict[str, Any],
+) -> np.ndarray:
+    stored = anchor.get("mean_lab")
+    if (
+        isinstance(stored, (list, tuple))
+        and len(stored) == 3
+    ):
+        try:
+            return np.asarray(stored, dtype=np.float64)
+        except (TypeError, ValueError):
+            pass
+    return np.asarray(
+        rgb_to_lab([
+            float(anchor["r"]),
+            float(anchor["g"]),
+            float(anchor["b"]),
+        ]),
+        dtype=np.float64,
+    )
+
+
 def _rows_delta_e_identity(rows: List[Dict[str, Any]]) -> float:
     errors: List[float] = []
     weights: List[float] = []
     for row in rows:
         t, r = row["target"], row["reference"]
         src = [float(t["r"]), float(t["g"]), float(t["b"])]
-        ref = [float(r["r"]), float(r["g"]), float(r["b"])]
-        errors.append(delta_e_2000(rgb_to_lab(src), rgb_to_lab(ref)))
+        errors.append(delta_e_2000(
+            rgb_to_lab(src),
+            _reference_lab_from_anchor(r),
+        ))
         weights.append(max(1e-4, float(row.get("weight", 1.0))))
     ea, wa = np.asarray(errors, dtype=np.float64), np.asarray(weights, dtype=np.float64)
     return float(np.sum(ea * wa) / max(1e-9, float(np.sum(wa))))
@@ -1209,8 +1233,12 @@ def _row_delta_e_arrays(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndar
     for row in rows:
         t, r = row["target"], row["reference"]
         errors.append(delta_e_2000(
-            rgb_to_lab([float(t["r"]), float(t["g"]), float(t["b"])]),
-            rgb_to_lab([float(r["r"]), float(r["g"]), float(r["b"])]),
+            rgb_to_lab([
+                float(t["r"]),
+                float(t["g"]),
+                float(t["b"]),
+            ]),
+            _reference_lab_from_anchor(r),
         ))
         weights.append(max(1e-4, float(row.get("weight", 1.0))))
     return np.asarray(errors, dtype=np.float64), np.asarray(weights, dtype=np.float64)
@@ -1248,6 +1276,73 @@ def _stage_stats(before_rows: List[Dict[str, Any]], after_rows: List[Dict[str, A
         "nonworse_fraction": nonworse,
         "improved_fraction": improved,
         "p75_worsening": p75,
+    }
+
+
+def _row_chroma_arrays(
+    rows: List[Dict[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_c: List[float] = []
+    reference_c: List[float] = []
+    weights: List[float] = []
+
+    for row in rows:
+        t = row["target"]
+        r = row["reference"]
+        t_lab = _lab_array_from_rgb(np.asarray(
+            [[float(t["r"]), float(t["g"]), float(t["b"])]],
+            dtype=np.float64,
+        ))[0]
+        r_lab = _reference_lab_from_anchor(r)
+        target_c.append(float(math.hypot(t_lab[1], t_lab[2])))
+        reference_c.append(float(math.hypot(r_lab[1], r_lab[2])))
+        weights.append(max(1e-4, float(row.get("weight", 1.0))))
+
+    return (
+        np.asarray(target_c, dtype=np.float64),
+        np.asarray(reference_c, dtype=np.float64),
+        np.asarray(weights, dtype=np.float64),
+    )
+
+
+def _chroma_stage_stats(
+    before_rows: List[Dict[str, Any]],
+    after_rows: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    before_c, reference_c, weights = _row_chroma_arrays(before_rows)
+    after_c, after_reference_c, after_weights = _row_chroma_arrays(after_rows)
+
+    if (
+        before_c.size == 0
+        or after_c.size != before_c.size
+        or float(np.sum(weights)) <= 0.0
+    ):
+        return {
+            "before": 0.0,
+            "after": 0.0,
+            "gain": 0.0,
+        }
+
+    if after_reference_c.size == reference_c.size:
+        reference_c = 0.5 * (
+            reference_c + after_reference_c
+        )
+    if after_weights.size == weights.size:
+        weights = 0.5 * (
+            weights + after_weights
+        )
+
+    total = max(1e-9, float(np.sum(weights)))
+    before_error = float(np.sum(
+        weights * np.abs(reference_c - before_c)
+    ) / total)
+    after_error = float(np.sum(
+        weights * np.abs(reference_c - after_c)
+    ) / total)
+    return {
+        "before": before_error,
+        "after": after_error,
+        "gain": before_error - after_error,
     }
 
 
@@ -1418,9 +1513,9 @@ def _row_lightness_arrays(
         target_l.append(float(rgb_to_lab([
             float(t["r"]), float(t["g"]), float(t["b"])
         ])[0]))
-        reference_l.append(float(rgb_to_lab([
-            float(r["r"]), float(r["g"]), float(r["b"])
-        ])[0]))
+        reference_l.append(float(
+            _reference_lab_from_anchor(r)[0]
+        ))
         weights.append(max(1e-4, float(row.get("weight", 1.0))) * _tone_weight_scale(float(row.get("q", 0.5)), lightness_balance))
 
     return (
@@ -1883,6 +1978,43 @@ def _limit_smooth_lightness_delta(
 
 
 
+def _limit_smooth_hue_delta(
+    l_nodes: np.ndarray,
+    values: np.ndarray,
+    max_degrees_per_l: float = 0.62,
+) -> np.ndarray:
+    """Limit d(Δh)/dL* so skin hue changes smoothly through the tonal range."""
+    x = np.asarray(l_nodes, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64).copy()
+    if y.size < 2:
+        return y
+
+    slope = math.radians(float(max_degrees_per_l))
+    min_step = math.radians(0.35)
+    for _ in range(3):
+        for i in range(1, y.size):
+            limit = max(
+                min_step,
+                abs(float(x[i] - x[i - 1])) * slope,
+            )
+            y[i] = float(np.clip(
+                y[i],
+                y[i - 1] - limit,
+                y[i - 1] + limit,
+            ))
+        for i in range(y.size - 2, -1, -1):
+            limit = max(
+                min_step,
+                abs(float(x[i + 1] - x[i])) * slope,
+            )
+            y[i] = float(np.clip(
+                y[i],
+                y[i + 1] - limit,
+                y[i + 1] + limit,
+            ))
+    return y
+
+
 def _shadow_lightening_gate(l_value: float) -> float:
     """Suppress positive local L* residuals in facial shadows.
 
@@ -1942,60 +2074,122 @@ def _fit_smooth_skin_model_once(
     rows: List[Dict[str, Any]],
     orthogonalize_lightness: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Smooth Lab base + weak local chroma RBF residual.
+    """Smooth LCh-like skin base + weak local chroma RBF residual.
 
-    v0.8.1 adds an explicit smooth chroma (saturation) correction. The model
-    separates the a/b correction into:
-      1) a smooth ΔC*(L*) term that increases/decreases chroma along hue,
-      2) a smaller smooth residual a/b term for hue / non-radial mismatch,
-      3) a weak local chroma-only RBF residual.
-    This keeps saturation under direct control without adding a separate
-    Photoshop adjustment layer.
+    The broad skin-colour transform is deliberately interpretable:
+      1) smooth residual ΔL*(L*),
+      2) smooth multiplicative chroma gain C*×g(L*) for saturation,
+      3) smooth angular Δh(L*) for hue,
+      4) a weak local chroma-only RBF for small remaining a/b errors.
+
+    This avoids asking independent smooth Δa/Δb curves to represent both hue
+    and saturation at the same time, which could make neighbouring skin tones
+    move in subtly inconsistent directions.
     """
     if len(rows) < 6:
         return None
 
     src_rgb = np.asarray(
-        [[float(row["target"][k]) for k in ("r", "g", "b")] for row in rows],
-        dtype=np.float64,
-    )
-    ref_rgb = np.asarray(
-        [[float(row["reference"][k]) for k in ("r", "g", "b")] for row in rows],
+        [
+            [float(row["target"][k]) for k in ("r", "g", "b")]
+            for row in rows
+        ],
         dtype=np.float64,
     )
     weights = np.asarray(
-        [max(0.02, float(row.get("weight", 1.0))) for row in rows],
+        [
+            max(0.02, float(row.get("weight", 1.0)))
+            for row in rows
+        ],
         dtype=np.float64,
     )
     src_lab = _lab_array_from_rgb(src_rgb)
-    ref_lab = _lab_array_from_rgb(ref_rgb)
+    ref_lab = np.asarray(
+        [
+            _reference_lab_from_anchor(row["reference"])
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
 
     desired = ref_lab - src_lab
     desired[:, 0] = np.clip(desired[:, 0], -3.5, 3.5)
     desired[:, 1:] = np.clip(desired[:, 1:], -12.0, 12.0)
 
-    src_chroma = np.sqrt(np.sum(src_lab[:, 1:3] ** 2, axis=1))
-    ref_chroma = np.sqrt(np.sum(ref_lab[:, 1:3] ** 2, axis=1))
-    desired_chroma = np.clip(ref_chroma - src_chroma, -7.0, 7.0)
+    src_chroma = np.sqrt(
+        np.sum(src_lab[:, 1:3] ** 2, axis=1)
+    )
+    ref_chroma = np.sqrt(
+        np.sum(ref_lab[:, 1:3] ** 2, axis=1)
+    )
+
+    # Saturation/chroma is fundamentally closer to a SCALE mismatch than to
+    # an additive a/b offset. The old additive ΔC was capped at about ±6 C*,
+    # which made strongly over/under-saturated real photographs barely move.
+    #
+    # Fit a smooth multiplicative gain in log space instead. A small chroma
+    # prior prevents unstable ratios close to the neutral axis.
+    chroma_prior = 1.0
+    desired_log_chroma_gain = np.log(np.clip(
+        (ref_chroma + chroma_prior)
+        / (src_chroma + chroma_prior),
+        0.40,
+        2.15,
+    ))
+
+    src_hue = np.arctan2(src_lab[:, 2], src_lab[:, 1])
+    ref_hue = np.arctan2(ref_lab[:, 2], ref_lab[:, 1])
+    desired_hue = np.arctan2(
+        np.sin(ref_hue - src_hue),
+        np.cos(ref_hue - src_hue),
+    )
+    desired_hue = np.clip(
+        desired_hue,
+        -math.radians(18.0),
+        math.radians(18.0),
+    )
+
+    # Hue becomes unstable close to the neutral axis. Such points may still
+    # contribute to L*/C*, but they should have very little influence on Δh.
+    hue_confidence = np.minimum(
+        _smoothstep(src_chroma, 5.0, 15.0),
+        _smoothstep(ref_chroma, 5.0, 15.0),
+    )
 
     grouped = []
-    for q in sorted(set(round(float(row.get("q", 0.0)), 2) for row in rows)):
-        idx = np.asarray([
-            i for i, row in enumerate(rows)
-            if round(float(row.get("q", 0.0)), 2) == q
-        ], dtype=np.int32)
+    for q in sorted(
+        set(round(float(row.get("q", 0.0)), 2) for row in rows)
+    ):
+        idx = np.asarray(
+            [
+                i for i, row in enumerate(rows)
+                if round(float(row.get("q", 0.0)), 2) == q
+            ],
+            dtype=np.int32,
+        )
         if idx.size == 0:
             continue
+
         w = weights[idx]
+        hue_w = w * np.maximum(0.05, hue_confidence[idx])
         grouped.append((
             q,
-            weighted_median(src_lab[idx, 0].tolist(), w.tolist()),
-            weighted_median(src_lab[idx, 1].tolist(), w.tolist()),
-            weighted_median(src_lab[idx, 2].tolist(), w.tolist()),
-            weighted_median(desired[idx, 0].tolist(), w.tolist()),
-            weighted_median(desired[idx, 1].tolist(), w.tolist()),
-            weighted_median(desired[idx, 2].tolist(), w.tolist()),
-            weighted_median(desired_chroma[idx].tolist(), w.tolist()),
+            weighted_median(
+                src_lab[idx, 0].tolist(),
+                w.tolist(),
+            ),
+            weighted_median(
+                desired[idx, 0].tolist(),
+                w.tolist(),
+            ),
+            weighted_median(
+                desired_log_chroma_gain[idx].tolist(),
+                w.tolist(),
+            ),
+            weighted_median(
+                desired_hue[idx].tolist(),
+                hue_w.tolist(),
+            ),
             float(np.sum(w)),
         ))
 
@@ -2003,22 +2197,34 @@ def _fit_smooth_skin_model_once(
         return None
 
     grouped.sort(key=lambda item: item[1])
-    l_nodes = np.asarray([row[1] for row in grouped], dtype=np.float64)
-    src_a_nodes = np.asarray([row[2] for row in grouped], dtype=np.float64)
-    src_b_nodes = np.asarray([row[3] for row in grouped], dtype=np.float64)
-    dl_raw = np.asarray([row[4] for row in grouped], dtype=np.float64)
-    da_raw = np.asarray([row[5] for row in grouped], dtype=np.float64)
-    db_raw = np.asarray([row[6] for row in grouped], dtype=np.float64)
-    dc_raw = np.asarray([row[7] for row in grouped], dtype=np.float64)
-    node_weights = np.asarray([row[8] for row in grouped], dtype=np.float64)
+    l_nodes = np.asarray(
+        [row[1] for row in grouped],
+        dtype=np.float64,
+    )
+    dl_raw = np.asarray(
+        [row[2] for row in grouped],
+        dtype=np.float64,
+    )
+    dlogc_raw = np.asarray(
+        [row[3] for row in grouped],
+        dtype=np.float64,
+    )
+    dh_raw = np.asarray(
+        [row[4] for row in grouped],
+        dtype=np.float64,
+    )
+    node_weights = np.asarray(
+        [row[5] for row in grouped],
+        dtype=np.float64,
+    )
 
-    # Global Tone owns the broad offset/slope of L*. When Tone was actually
-    # accepted, remove most of that low-order component from Skin Match so the
-    # two stages do not fight each other. Skin Match retains only a small
-    # smooth residual curvature.
+    # Global Tone owns broad L* offset/slope. When Tone was accepted, remove
+    # most of that low-order trend from Skin Match and keep residual curvature.
     removed_lightness_trend = np.zeros_like(dl_raw)
     if orthogonalize_lightness and len(dl_raw) >= 3:
-        l_center = float(np.average(l_nodes, weights=node_weights))
+        l_center = float(
+            np.average(l_nodes, weights=node_weights)
+        )
         l_scale = max(8.0, float(np.ptp(l_nodes)))
         x = (l_nodes - l_center) / l_scale
         design = np.column_stack([np.ones_like(x), x])
@@ -2030,17 +2236,17 @@ def _fit_smooth_skin_model_once(
                 rcond=None,
             )
             global_trend = design @ coeff
-            # Remove only half of the broad trend. The constrained Photoshop
-            # Tone curve may intentionally leave a useful residual, so Skin
-            # Match keeps the other half while avoiding a second full global
-            # tone correction.
             removed_lightness_trend = 0.50 * global_trend
             dl_raw = dl_raw - removed_lightness_trend
         except np.linalg.LinAlgError:
             pass
 
     dl = np.clip(
-        _smooth_weighted_series(dl_raw, node_weights, 3.4),
+        _smooth_weighted_series(
+            dl_raw,
+            node_weights,
+            3.4,
+        ),
         -2.8 if orthogonalize_lightness else -3.2,
         2.8 if orthogonalize_lightness else 3.2,
     )
@@ -2050,56 +2256,60 @@ def _fit_smooth_skin_model_once(
         max_delta_slope=0.085,
     )
 
-    # Explicit saturation control: a smooth ΔC*(L*) correction. This is safer
-    # than letting all chroma differences be implicitly absorbed by independent
-    # Δa/Δb nodes, because the dominant effect stays radial in a/b.
-    dc = np.clip(
-        _smooth_weighted_series(dc_raw, node_weights, 1.10),
-        -6.0, 6.0,
+    # Saturation/chroma stays radial in a/b, but is now multiplicative.
+    # The supported range is deliberately broad enough to fix clearly
+    # over/under-saturated photographs while remaining bounded.
+    dlogc = np.clip(
+        _smooth_weighted_series(
+            dlogc_raw,
+            node_weights,
+            1.00,
+        ),
+        math.log(0.45),
+        math.log(2.10),
     )
-    dc = _limit_smooth_lightness_delta(
+    dlogc = _limit_smooth_lightness_delta(
         l_nodes,
-        dc,
-        max_delta_slope=0.18,
+        dlogc,
+        max_delta_slope=0.020,
     )
 
-    src_c_nodes = np.sqrt(src_a_nodes ** 2 + src_b_nodes ** 2)
-    src_units = np.column_stack([src_a_nodes, src_b_nodes])
-    valid_unit = src_c_nodes >= 1.0
-    if np.any(valid_unit):
-        src_units[valid_unit] = src_units[valid_unit] / src_c_nodes[valid_unit, None]
-    if np.any(~valid_unit):
-        median_ab = np.median(src_lab[:, 1:3], axis=0)
-        fallback_n = float(np.linalg.norm(median_ab))
-        fallback_u = median_ab / fallback_n if fallback_n > 1e-9 else np.asarray([1.0, 0.0], dtype=np.float64)
-        src_units[~valid_unit] = fallback_u.reshape(1, 2)
-
-    chroma_a_nodes = src_units[:, 0] * dc
-    chroma_b_nodes = src_units[:, 1] * dc
-
-    # The remaining smooth a/b residual handles hue rotation and other
-    # non-radial differences after the saturation component is removed.
-    da = np.clip(
-        _smooth_weighted_series(da_raw - chroma_a_nodes, node_weights, 1.30),
-        -5.5, 5.5,
+    # Hue is an explicit smooth angular field, rather than an implicit
+    # combination of two unrelated Δa/Δb series.
+    dh = np.clip(
+        _smooth_weighted_series(
+            dh_raw,
+            node_weights,
+            1.85,
+        ),
+        -math.radians(15.0),
+        math.radians(15.0),
     )
-    db = np.clip(
-        _smooth_weighted_series(db_raw - chroma_b_nodes, node_weights, 1.30),
-        -5.5, 5.5,
+    dh = _limit_smooth_hue_delta(
+        l_nodes,
+        dh,
+        max_degrees_per_l=0.62,
     )
 
     spacing = np.diff(l_nodes)
     l_sigma = max(
         6.5,
-        float(np.median(spacing)) * 1.35 if spacing.size else 9.0,
+        float(np.median(spacing)) * 1.35
+        if spacing.size else 9.0,
     )
 
     ab = src_lab[:, 1:3]
     ab_center = np.median(ab, axis=0)
     centered = ab - ab_center.reshape(1, 2)
     if len(ab) >= 3:
-        cov = np.cov(centered.T, aweights=np.maximum(weights, 1e-4))
-        cov = np.asarray(cov, dtype=np.float64).reshape(2, 2)
+        cov = np.cov(
+            centered.T,
+            aweights=np.maximum(weights, 1e-4),
+        )
+        cov = np.asarray(
+            cov,
+            dtype=np.float64,
+        ).reshape(2, 2)
     else:
         cov = np.eye(2, dtype=np.float64) * 16.0
     cov += np.eye(2, dtype=np.float64) * 8.0
@@ -2108,21 +2318,26 @@ def _fit_smooth_skin_model_once(
     except np.linalg.LinAlgError:
         inv_cov = np.linalg.pinv(cov)
 
-    ab_unit_fallback = np.median(src_lab[:, 1:3], axis=0)
+    ab_unit_fallback = np.median(
+        src_lab[:, 1:3],
+        axis=0,
+    )
     fallback_norm = float(np.linalg.norm(ab_unit_fallback))
     if fallback_norm <= 1e-9:
-        ab_unit_fallback = np.asarray([1.0, 0.0], dtype=np.float64)
+        ab_unit_fallback = np.asarray(
+            [1.0, 0.0],
+            dtype=np.float64,
+        )
     else:
-        ab_unit_fallback = ab_unit_fallback / fallback_norm
+        ab_unit_fallback = (
+            ab_unit_fallback / fallback_norm
+        )
 
     model: Dict[str, Any] = {
         "l_nodes": l_nodes,
         "delta_l": dl,
-        "delta_c": dc,
-        "delta_a": da,
-        "delta_b": db,
-        "src_a_nodes": src_a_nodes,
-        "src_b_nodes": src_b_nodes,
+        "log_chroma_gain": dlogc,
+        "delta_h": dh,
         "node_weights": node_weights,
         "l_sigma": float(l_sigma),
         "src_lab": src_lab,
@@ -2130,28 +2345,83 @@ def _fit_smooth_skin_model_once(
         "ab_center": ab_center,
         "ab_unit_fallback": ab_unit_fallback,
         "inv_cov": inv_cov,
-        "l_low": float(np.percentile(src_lab[:, 0], 3.0) - 8.0),
-        "l_high": float(np.percentile(src_lab[:, 0], 97.0) + 8.0),
+        "l_low": float(
+            np.percentile(src_lab[:, 0], 3.0) - 8.0
+        ),
+        "l_high": float(
+            np.percentile(src_lab[:, 0], 97.0) + 8.0
+        ),
         "rbf_sigma_l": 9.0,
         "rbf_sigma_ab": 11.5,
-        "orthogonalized_lightness": bool(orthogonalize_lightness),
-        "removed_lightness_trend": removed_lightness_trend,
+        "orthogonalized_lightness": bool(
+            orthogonalize_lightness
+        ),
+        "removed_lightness_trend": (
+            removed_lightness_trend
+        ),
+        "colour_model": "LChGain+Hue+RBF",
     }
 
-    # Fit the remaining full-Lab error around the smooth model. The explicit
-    # ΔC*(L*) term usually reduces residual saturation error before RBF.
+    # Fit only the small remaining full-Lab error around the LCh base. The
+    # local residual remains chroma-only so it cannot create tonal bumps.
     base_at_samples = np.asarray(
-        [_smooth_skin_base_delta_lab(lab, model) for lab in src_lab],
+        [
+            _smooth_skin_base_delta_lab(lab, model)
+            for lab in src_lab
+        ],
         dtype=np.float64,
     )
     rbf_residual = desired - base_at_samples
-    # Local RBF must never create local tonal bumps. L* remains in the
-    # smooth lightness-dependent base only; RBF refines chroma (a/b).
     rbf_residual[:, 0] = 0.0
-    rbf_residual[:, 1:] = np.clip(
-        rbf_residual[:, 1:],
-        -2.6,
-        2.6,
+
+    # The smooth multiplicative chroma field owns saturation. The local RBF
+    # should mainly correct HUE/local direction, otherwise a generic a/b
+    # residual can accidentally inject a strong radial C* increase.
+    corrected_sample_ab = (
+        src_lab[:, 1:3] + base_at_samples[:, 1:3]
+    )
+    corrected_sample_c = np.sqrt(
+        np.sum(corrected_sample_ab ** 2, axis=1)
+    )
+    radial_unit = np.zeros_like(corrected_sample_ab)
+    radial_mask = corrected_sample_c >= 1.0
+    if np.any(radial_mask):
+        radial_unit[radial_mask] = (
+            corrected_sample_ab[radial_mask]
+            / corrected_sample_c[radial_mask, None]
+        )
+    if np.any(~radial_mask):
+        radial_unit[~radial_mask] = (
+            ab_unit_fallback.reshape(1, 2)
+        )
+
+    residual_ab = rbf_residual[:, 1:3]
+    radial_amount = np.sum(
+        residual_ab * radial_unit,
+        axis=1,
+    )
+    tangential = (
+        residual_ab
+        - radial_amount[:, None] * radial_unit
+    )
+    # Keep only a very small radial fine correction; allow more tangential
+    # freedom for hue/local colour direction.
+    radial_amount = np.clip(
+        radial_amount,
+        -0.70,
+        0.70,
+    )
+    tangential_norm = np.sqrt(
+        np.sum(tangential ** 2, axis=1)
+    )
+    tangential_scale = np.minimum(
+        1.0,
+        2.6 / np.maximum(tangential_norm, 1e-9),
+    )
+    tangential *= tangential_scale[:, None]
+    rbf_residual[:, 1:3] = (
+        tangential
+        + radial_amount[:, None] * radial_unit
     )
 
     model["rbf_centers"] = src_lab
@@ -2185,12 +2455,14 @@ def _fit_smooth_skin_model(
         [float(row["target"][k]) for k in ("r", "g", "b")]
         for row in rows
     ], dtype=np.float64)
-    ref_rgb = np.asarray([
-        [float(row["reference"][k]) for k in ("r", "g", "b")]
-        for row in rows
-    ], dtype=np.float64)
     src_lab = _lab_array_from_rgb(src_rgb)
-    ref_lab = _lab_array_from_rgb(ref_rgb)
+    ref_lab = np.asarray(
+        [
+            _reference_lab_from_anchor(row["reference"])
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
     desired = ref_lab - src_lab
     smooth_prediction = np.asarray([
         _smooth_skin_base_delta_lab(lab, model)
@@ -2246,41 +2518,74 @@ def _smooth_skin_base_delta_lab(
     model: Dict[str, Any],
 ) -> np.ndarray:
     labv = np.asarray(lab, dtype=np.float64)
-    l_nodes = np.asarray(model["l_nodes"], dtype=np.float64)
-    node_weights = np.asarray(model["node_weights"], dtype=np.float64)
-    sigma = max(4.0, float(model["l_sigma"]))
-
-    kernel = node_weights * np.exp(
-        -0.5 * ((labv[0] - l_nodes) / sigma) ** 2
+    l_nodes = np.asarray(
+        model["l_nodes"],
+        dtype=np.float64,
     )
-    support = float(np.sum(kernel))
-    if support <= 1e-9:
-        return np.zeros(3, dtype=np.float64)
 
-    prior = 0.18
-    denom = support + prior
-
-    # Lightness stays a smooth 1-D function of L*. Chroma is split into an
-    # explicit saturation correction ΔC*(L*) plus a smaller residual Δa/Δb.
     delta_l = float(np.interp(
         labv[0],
         l_nodes,
-        np.asarray(model["delta_l"], dtype=np.float64),
+        np.asarray(
+            model["delta_l"],
+            dtype=np.float64,
+        ),
     ))
-    delta_c = float(np.interp(
+    log_chroma_gain = float(np.interp(
         labv[0],
         l_nodes,
-        np.asarray(model.get("delta_c", np.zeros_like(l_nodes)), dtype=np.float64),
+        np.asarray(
+            model.get(
+                "log_chroma_gain",
+                np.zeros_like(l_nodes),
+            ),
+            dtype=np.float64,
+        ),
     ))
+    delta_h = float(np.interp(
+        labv[0],
+        l_nodes,
+        np.asarray(
+            model.get(
+                "delta_h",
+                np.zeros_like(l_nodes),
+            ),
+            dtype=np.float64,
+        ),
+    ))
+
+    ab = np.asarray(labv[1:3], dtype=np.float64)
+    chroma = float(np.linalg.norm(ab))
     unit_ab = _unit_ab_from_lab(
         labv,
-        np.asarray(model.get("ab_unit_fallback", [1.0, 0.0]), dtype=np.float64),
+        np.asarray(
+            model.get(
+                "ab_unit_fallback",
+                [1.0, 0.0],
+            ),
+            dtype=np.float64,
+        ),
     )
+    hue = math.atan2(
+        float(unit_ab[1]),
+        float(unit_ab[0]),
+    )
+    chroma_gain = float(np.clip(
+        math.exp(log_chroma_gain),
+        0.45,
+        2.10,
+    ))
+    corrected_chroma = max(0.0, chroma * chroma_gain)
+    corrected_hue = hue + delta_h
+    corrected_ab = np.asarray([
+        corrected_chroma * math.cos(corrected_hue),
+        corrected_chroma * math.sin(corrected_hue),
+    ], dtype=np.float64)
 
     return np.asarray([
         delta_l,
-        float(unit_ab[0] * delta_c + np.sum(kernel * np.asarray(model["delta_a"])) / denom),
-        float(unit_ab[1] * delta_c + np.sum(kernel * np.asarray(model["delta_b"])) / denom),
+        corrected_ab[0] - ab[0],
+        corrected_ab[1] - ab[1],
     ], dtype=np.float64)
 
 
@@ -2441,7 +2746,7 @@ def _smooth_skin_delta_lab(
     combined[0] = float(np.clip(combined[0], -3.2, 3.2))
     if combined[0] > 0.0:
         combined[0] *= _shadow_lightening_gate(float(np.asarray(lab)[0]))
-    combined[1:] = np.clip(combined[1:], -10.0, 10.0)
+    combined[1:] = np.clip(combined[1:], -18.0, 18.0)
 
     result = np.zeros(3, dtype=np.float64)
     result[0] = (
@@ -2669,6 +2974,7 @@ def _choose_smooth_skin_strength(
 ) -> Tuple[float, Dict[str, float]]:
     """Choose strength using the actual exported LUT, not the continuous model."""
     baseline = float(_rows_delta_e_identity(rows))
+    baseline_chroma = _chroma_stage_stats(rows, rows)
     protection = _protection_profile(protection_bias, minimum_gain)
     max_strength = float(np.clip(
         protection["max_skin_strength"],
@@ -2701,6 +3007,10 @@ def _choose_smooth_skin_strength(
     for strength in strengths:
         actual_rows = _rows_after_lut(rows, lut, float(strength))
         stats = _stage_stats(rows, actual_rows)
+        chroma_stats = _chroma_stage_stats(
+            rows,
+            actual_rows,
+        )
         cv_after = float(cv_scores[float(strength)])
         cv_gain = cv_baseline - cv_after
         collateral = _lut_collateral_stats(
@@ -2722,13 +3032,20 @@ def _choose_smooth_skin_strength(
         )
         score = float(
             stats["after"]
-            + protection["score_cv_weight"] * max(0.0, cv_after - stats["after"])
-            + protection["score_collateral_weight"] * _collateral_penalty(collateral, fine_tune=False)
+            + 0.12 * chroma_stats["after"]
+            + protection["score_cv_weight"]
+                * max(0.0, cv_after - stats["after"])
+            + protection["score_collateral_weight"]
+                * _collateral_penalty(
+                    collateral,
+                    fine_tune=False,
+                )
         )
         candidates.append({
             "strength": float(strength),
             "rows": actual_rows,
             "stats": stats,
+            "chroma": chroma_stats,
             "cv_after": cv_after,
             "cv_gain": cv_gain,
             "collateral": collateral,
@@ -2753,6 +3070,13 @@ def _choose_smooth_skin_strength(
             "cv_gain": cv_baseline - best_cv,
             "full_after": best_actual,
             "full_gain": max(0.0, baseline - best_actual),
+            "chroma_before": float(
+                baseline_chroma["before"]
+            ),
+            "chroma_after": float(
+                baseline_chroma["before"]
+            ),
+            "chroma_gain": 0.0,
             "nonworse_fraction": 1.0,
             "collateral_count": 0.0,
             "collateral_affected_fraction": 0.0,
@@ -2766,11 +3090,24 @@ def _choose_smooth_skin_strength(
         float(item["stats"]["gain"])
         for item in valid_candidates
     )
+    best_chroma_gain = max(
+        float(item["chroma"]["gain"])
+        for item in valid_candidates
+    )
+    chroma_is_material = (
+        float(baseline_chroma["before"]) >= 1.0
+        and best_chroma_gain > 0.15
+    )
     near_best = [
         item for item in valid_candidates
         if (
             float(item["stats"]["gain"])
             >= best_gain * protection["near_best_gain_ratio"]
+            and (
+                not chroma_is_material
+                or float(item["chroma"]["gain"])
+                    >= best_chroma_gain * 0.94
+            )
             and float(item["score"])
             <= float(best["score"])
             + protection["near_best_score_extra"]
@@ -2805,6 +3142,15 @@ def _choose_smooth_skin_strength(
         "cv_gain": float(chosen["cv_gain"]),
         "full_after": float(stats["after"]),
         "full_gain": float(stats["gain"]),
+        "chroma_before": float(
+            baseline_chroma["before"]
+        ),
+        "chroma_after": float(
+            chosen["chroma"]["after"]
+        ),
+        "chroma_gain": float(
+            chosen["chroma"]["gain"]
+        ),
         "nonworse_fraction": float(stats["nonworse_fraction"]),
         "collateral_count": float(collateral.get("count", 0.0)),
         "collateral_affected_fraction": float(
@@ -2827,12 +3173,18 @@ def _smooth_skin_delta_lab_array(
     result = np.zeros_like(values)
 
     l_nodes = np.asarray(model["l_nodes"], dtype=np.float64)
-    node_weights = np.asarray(model["node_weights"], dtype=np.float64)
-    sigma = max(4.0, float(model["l_sigma"]))
     delta_l = np.asarray(model["delta_l"], dtype=np.float64)
-    delta_c = np.asarray(model.get("delta_c", np.zeros_like(l_nodes)), dtype=np.float64)
-    delta_a = np.asarray(model["delta_a"], dtype=np.float64)
-    delta_b = np.asarray(model["delta_b"], dtype=np.float64)
+    log_chroma_gain = np.asarray(
+        model.get(
+            "log_chroma_gain",
+            np.zeros_like(l_nodes),
+        ),
+        dtype=np.float64,
+    )
+    delta_h = np.asarray(
+        model.get("delta_h", np.zeros_like(l_nodes)),
+        dtype=np.float64,
+    )
 
     centers = np.asarray(model.get("rbf_centers"), dtype=np.float64)
     residuals = np.asarray(model.get("rbf_residuals"), dtype=np.float64)
@@ -2852,29 +3204,47 @@ def _smooth_skin_delta_lab_array(
         stop = min(values.shape[0], start + int(chunk_size))
         lab = values[start:stop]
 
-        # Smooth lightness-dependent base.
-        kernel = (
-            np.exp(
-                -0.5
-                * ((lab[:, 0:1] - l_nodes.reshape(1, -1)) / sigma) ** 2
-            )
-            * node_weights.reshape(1, -1)
-        )
-        support = np.sum(kernel, axis=1) + 0.18
+        # Smooth LCh-like base: residual L*, radial chroma, angular hue.
         unit_ab = _unit_ab_from_lab_array(
             lab,
             ab_unit_fallback,
         )
-        chroma_component = unit_ab * np.interp(
+        chroma = np.sqrt(
+            np.sum(lab[:, 1:3] ** 2, axis=1)
+        )
+        dlogc = np.interp(
             lab[:, 0],
             l_nodes,
-            delta_c,
-        )[:, None]
-        base = np.stack([
+            log_chroma_gain,
+        )
+        dh = np.interp(
+            lab[:, 0],
+            l_nodes,
+            delta_h,
+        )
+        hue = np.arctan2(
+            unit_ab[:, 1],
+            unit_ab[:, 0],
+        )
+        chroma_gain = np.clip(
+            np.exp(dlogc),
+            0.45,
+            2.10,
+        )
+        corrected_chroma = np.maximum(
+            0.0,
+            chroma * chroma_gain,
+        )
+        corrected_hue = hue + dh
+        corrected_ab = np.column_stack([
+            corrected_chroma * np.cos(corrected_hue),
+            corrected_chroma * np.sin(corrected_hue),
+        ])
+        delta_ab = corrected_ab - lab[:, 1:3]
+        base = np.column_stack([
             np.interp(lab[:, 0], l_nodes, delta_l),
-            chroma_component[:, 0] + (kernel @ delta_a) / support,
-            chroma_component[:, 1] + (kernel @ delta_b) / support,
-        ], axis=1)
+            delta_ab,
+        ])
 
         # Local RBF residual.
         dl = lab[:, None, 0] - centers[None, :, 0]
@@ -2905,7 +3275,7 @@ def _smooth_skin_delta_lab_array(
                 )
             )
             combined[positive_l, 0] *= lift_gate[positive_l]
-        combined[:, 1:] = np.clip(combined[:, 1:], -10.0, 10.0)
+        combined[:, 1:] = np.clip(combined[:, 1:], -18.0, 18.0)
 
         # Same skin-gamut gate as scalar path.
         ab_delta = lab[:, 1:3] - ab_center.reshape(1, 2)
@@ -3205,15 +3575,56 @@ def _build_chroma_refinement_lut(rows: List[Dict[str, Any]], size: int = 17) -> 
     if not rows:
         return None
     src_rgb = np.asarray([[float(row["target"][k]) for k in ("r", "g", "b")] for row in rows], dtype=np.float64)
-    ref_rgb = np.asarray([[float(row["reference"][k]) for k in ("r", "g", "b")] for row in rows], dtype=np.float64)
     weights = np.asarray([max(0.02, float(row.get("weight", 1.0))) for row in rows], dtype=np.float64)
     src_lab = _lab_array_from_rgb(src_rgb)
-    ref_lab = _lab_array_from_rgb(ref_rgb)
+    ref_lab = np.asarray(
+        [
+            _reference_lab_from_anchor(row["reference"])
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
     residual_lab = ref_lab - src_lab
-    # Refinement is local, therefore it is chroma-only. Any remaining L*
-    # correction must stay in the smooth 1-D lightness field above.
+    # Refinement is local and L*-neutral. Saturation is already owned by the
+    # smooth multiplicative chroma model, so keep refinement mostly tangential
+    # (hue/local direction) and tightly limit any radial C* correction.
     residual_lab[:, 0] = 0.0
-    residual_lab[:, 1:] = np.clip(residual_lab[:, 1:], -4.0, 4.0)
+
+    src_ab = src_lab[:, 1:3]
+    src_c = np.sqrt(np.sum(src_ab ** 2, axis=1))
+    radial_unit = np.zeros_like(src_ab)
+    mask = src_c >= 1.0
+    if np.any(mask):
+        radial_unit[mask] = src_ab[mask] / src_c[mask, None]
+    if np.any(~mask):
+        fallback = np.median(src_ab, axis=0)
+        fallback_norm = float(np.linalg.norm(fallback))
+        if fallback_norm <= 1e-9:
+            fallback = np.asarray([1.0, 0.0], dtype=np.float64)
+        else:
+            fallback = fallback / fallback_norm
+        radial_unit[~mask] = fallback.reshape(1, 2)
+
+    residual_ab = residual_lab[:, 1:3]
+    radial_amount = np.sum(
+        residual_ab * radial_unit,
+        axis=1,
+    )
+    tangential = (
+        residual_ab
+        - radial_amount[:, None] * radial_unit
+    )
+    radial_amount = np.clip(radial_amount, -0.80, 0.80)
+    tangential_norm = np.sqrt(np.sum(tangential ** 2, axis=1))
+    tangential_scale = np.minimum(
+        1.0,
+        3.2 / np.maximum(tangential_norm, 1e-9),
+    )
+    tangential *= tangential_scale[:, None]
+    residual_lab[:, 1:3] = (
+        tangential
+        + radial_amount[:, None] * radial_unit
+    )
 
     levels = np.linspace(0.0, 255.0, int(size), dtype=np.float64)
     nodes: List[List[float]] = []
@@ -3816,6 +4227,14 @@ def fit_smooth_match(
                         tone_rows,
                         candidate_rows,
                     )
+                    chroma_stats = _chroma_stage_stats(
+                        tone_rows,
+                        candidate_rows,
+                    )
+                    primary_chroma_stats = _chroma_stage_stats(
+                        tone_rows,
+                        primary_rows,
+                    )
                     incremental_gain = (
                         float(primary_stats["after"])
                         - float(stats["after"])
@@ -3835,6 +4254,11 @@ def fit_smooth_match(
                     if stats["p75_worsening"] > protection["fine_p75"]:
                         continue
                     if incremental_gain < protection["fine_min_gain"]:
+                        continue
+                    if (
+                        chroma_stats["after"]
+                        > primary_chroma_stats["after"] + 0.15
+                    ):
                         continue
 
                     score = float(
@@ -3956,6 +4380,18 @@ def fit_smooth_match(
             float(skin_diag.get("cv_gain", 0.0)),
             3,
         ),
+        "skin_chroma_before": round(
+            float(skin_diag.get("chroma_before", 0.0)),
+            3,
+        ),
+        "skin_chroma_after": round(
+            float(skin_diag.get("chroma_after", 0.0)),
+            3,
+        ),
+        "skin_chroma_gain": round(
+            float(skin_diag.get("chroma_gain", 0.0)),
+            3,
+        ),
         "skin_refinement_used": bool(refinement_used),
         "skin_refinement_strength": round(
             float(refinement_strength),
@@ -3999,7 +4435,7 @@ def fit_smooth_match(
             skin_model.get("orthogonalized_lightness", False)
             if skin_model is not None else False
         ),
-        "strategy": "unified",
+        "strategy": "unified LCh skin",
     }
 
     return {
@@ -4080,6 +4516,369 @@ def safe_preset_filename(name: str, preset_id: str) -> str:
     return f"{clean} [{preset_id[:8]}].json"
 
 
+
+def _reference_count(data: Dict[str, Any]) -> int:
+    model = data.get("reference_model") or {}
+    return max(
+        1,
+        int(
+            data.get("reference_count")
+            or model.get("reference_count")
+            or 1
+        ),
+    )
+
+
+def _anchor_samples(anchor: Dict[str, Any], fallback: int) -> int:
+    return max(
+        1,
+        int(anchor.get("samples") or fallback or 1),
+    )
+
+
+def _anchor_rgb(anchor: Dict[str, Any]) -> np.ndarray:
+    return np.asarray([
+        float(anchor.get("r", 0.0)),
+        float(anchor.get("g", 0.0)),
+        float(anchor.get("b", 0.0)),
+    ], dtype=np.float64)
+
+
+def _anchor_mean_lab(anchor: Dict[str, Any]) -> np.ndarray:
+    stored = anchor.get("mean_lab")
+    if (
+        isinstance(stored, (list, tuple))
+        and len(stored) == 3
+    ):
+        try:
+            return np.asarray(stored, dtype=np.float64)
+        except (TypeError, ValueError):
+            pass
+    return _lab_array_from_rgb(
+        _anchor_rgb(anchor).reshape(1, 3)
+    )[0]
+
+
+def _combine_reference_anchor(
+    old: Dict[str, Any],
+    new: Dict[str, Any],
+    old_fallback_samples: int,
+) -> Dict[str, Any]:
+    old_n = _anchor_samples(
+        old,
+        old_fallback_samples,
+    )
+    new_n = _anchor_samples(new, 1)
+    total = old_n + new_n
+
+    old_lab = _anchor_mean_lab(old)
+    new_lab = _anchor_mean_lab(new)
+    mean_lab = (
+        old_lab * float(old_n)
+        + new_lab * float(new_n)
+    ) / float(total)
+    mean_rgb = _rgb_array_from_lab(
+        mean_lab.reshape(1, 3)
+    )[0]
+
+    spread = (
+        float(old.get("spread", 0.0)) * float(old_n)
+        + float(new.get("spread", 0.0)) * float(new_n)
+    ) / float(total)
+    window_count = int(round(
+        (
+            float(old.get("count", 0) or 0) * float(old_n)
+            + float(new.get("count", 0) or 0) * float(new_n)
+        )
+        / float(total)
+    ))
+
+    return {
+        "q": float(new.get("q", old.get("q", 0.0))),
+        "r": float(mean_rgb[0]),
+        "g": float(mean_rgb[1]),
+        "b": float(mean_rgb[2]),
+        "y": float(
+            0.2126 * mean_rgb[0]
+            + 0.7152 * mean_rgb[1]
+            + 0.0722 * mean_rgb[2]
+        ),
+        "count": window_count,
+        "spread": float(spread),
+        "samples": int(total),
+        "mean_lab": [
+            float(mean_lab[0]),
+            float(mean_lab[1]),
+            float(mean_lab[2]),
+        ],
+    }
+
+
+def _merge_anchor_lists(
+    old_anchors: Sequence[Dict[str, Any]],
+    new_anchors: Sequence[Dict[str, Any]],
+    old_fallback_samples: int,
+) -> List[Dict[str, Any]]:
+    old_map = {
+        round(float(item.get("q", 0.0)), 2): dict(item)
+        for item in old_anchors
+    }
+    new_map = {
+        round(float(item.get("q", 0.0)), 2): dict(item)
+        for item in new_anchors
+    }
+    result: List[Dict[str, Any]] = []
+
+    for q in sorted(set(old_map.keys()) | set(new_map.keys())):
+        old = old_map.get(q)
+        new = new_map.get(q)
+        if old is not None and new is not None:
+            item = _combine_reference_anchor(
+                old,
+                new,
+                old_fallback_samples,
+            )
+        elif old is not None:
+            item = dict(old)
+            item["samples"] = _anchor_samples(
+                old,
+                old_fallback_samples,
+            )
+            if "mean_lab" not in item:
+                item["mean_lab"] = [
+                    float(v)
+                    for v in _anchor_mean_lab(item)
+                ]
+        else:
+            item = dict(new or {})
+            item["samples"] = _anchor_samples(
+                item,
+                1,
+            )
+            if "mean_lab" not in item:
+                item["mean_lab"] = [
+                    float(v)
+                    for v in _anchor_mean_lab(item)
+                ]
+        result.append(item)
+
+    return result
+
+
+def _weighted_optional_number(
+    old_value: Any,
+    new_value: Any,
+    old_count: int,
+    new_count: int = 1,
+) -> Optional[float]:
+    values = []
+    weights = []
+    if old_value is not None:
+        try:
+            values.append(float(old_value))
+            weights.append(float(old_count))
+        except (TypeError, ValueError):
+            pass
+    if new_value is not None:
+        try:
+            values.append(float(new_value))
+            weights.append(float(new_count))
+        except (TypeError, ValueError):
+            pass
+    if not values:
+        return None
+    return float(np.average(
+        np.asarray(values, dtype=np.float64),
+        weights=np.asarray(weights, dtype=np.float64),
+    ))
+
+
+def _aggregate_cheek_delta_e(
+    zones: Dict[str, Any],
+) -> Optional[float]:
+    cheek_labs = []
+    for name in ("left_cheek", "right_cheek"):
+        anchors = (zones.get(name) or {}).get("anchors") or []
+        if not anchors:
+            return None
+        item = min(
+            anchors,
+            key=lambda anchor: abs(
+                float(anchor.get("q", 0.5)) - 0.5
+            ),
+        )
+        cheek_labs.append(
+            _lab_array_from_rgb(
+                _anchor_rgb(item).reshape(1, 3)
+            )[0]
+        )
+    return float(delta_e_2000(
+        cheek_labs[0],
+        cheek_labs[1],
+    ))
+
+
+def merge_reference_models(
+    old: Dict[str, Any],
+    new: Dict[str, Any],
+    old_count: int,
+) -> Dict[str, Any]:
+    """Add one equally weighted reference image to an existing mean model.
+
+    Corresponding zone/quantile colours are averaged in Lab rather than encoded
+    sRGB. Each anchor tracks how many source images actually contributed to it,
+    so a missing zone in one reference does not dilute measurements from the
+    other images.
+    """
+    old_count = max(1, int(old_count))
+    total_count = old_count + 1
+
+    old_zones = old.get("zones") or {}
+    new_zones = new.get("zones") or {}
+    zones: Dict[str, Any] = {}
+
+    for name in sorted(set(old_zones.keys()) | set(new_zones.keys())):
+        old_zone = old_zones.get(name) or {}
+        new_zone = new_zones.get(name) or {}
+        anchors = _merge_anchor_lists(
+            old_zone.get("anchors") or [],
+            new_zone.get("anchors") or [],
+            old_count,
+        )
+        if not anchors:
+            continue
+
+        old_pixels = old_zone.get("pixels")
+        new_pixels = new_zone.get("pixels")
+        if old_pixels is not None and new_pixels is not None:
+            pixels = int(round(
+                (
+                    float(old_pixels) * old_count
+                    + float(new_pixels)
+                )
+                / float(total_count)
+            ))
+        elif old_pixels is not None:
+            pixels = int(old_pixels)
+        else:
+            pixels = int(new_pixels or 0)
+
+        zones[name] = {
+            "anchors": anchors,
+            "pixels": pixels,
+        }
+
+    old_pooled = old.get("pooled") or {}
+    new_pooled = new.get("pooled") or {}
+    pooled_anchors = _merge_anchor_lists(
+        old_pooled.get("anchors") or [],
+        new_pooled.get("anchors") or [],
+        old_count,
+    )
+    pooled_pixels = int(round(
+        (
+            float(old_pooled.get("pixels", 0) or 0) * old_count
+            + float(new_pooled.get("pixels", 0) or 0)
+        )
+        / float(total_count)
+    ))
+
+    old_quality = old.get("quality") or {}
+    new_quality = new.get("quality") or {}
+    quality: Dict[str, Any] = {}
+    for key in (
+        "seed_pixels",
+        "candidate_pixels",
+        "skin_pixels",
+        "ab_threshold",
+        "score",
+    ):
+        value = _weighted_optional_number(
+            old_quality.get(key),
+            new_quality.get(key),
+            old_count,
+            1,
+        )
+        quality[key] = (
+            round(value, 2) if value is not None else None
+        )
+
+    cheek_de = _aggregate_cheek_delta_e(zones)
+    quality["cheek_delta_e"] = (
+        round(cheek_de, 3)
+        if cheek_de is not None else None
+    )
+
+    old_face = old.get("face") or {}
+    new_face = new.get("face") or {}
+    old_normalized_count = int(
+        old_face.get("normalized_samples")
+        or (
+            old_count
+            if bool(old_face.get("normalized"))
+            else 0
+        )
+    )
+    normalized_count = (
+        old_normalized_count
+        + (1 if bool(new_face.get("normalized")) else 0)
+    )
+    normalized = (
+        normalized_count * 2 >= total_count
+    )
+    face_score = _weighted_optional_number(
+        old_face.get("score"),
+        new_face.get("score"),
+        old_count,
+        1,
+    )
+
+    result = {
+        "zones": zones,
+        "pooled": {
+            "anchors": pooled_anchors,
+            "pixels": pooled_pixels,
+        },
+        # Reference-side WB is not consumed by matching. Keep the aggregate
+        # model explicit rather than inventing a scene-wide mean white balance.
+        "white_balance": {
+            "enabled": False,
+            "confidence": 0.0,
+            "strength": 0.0,
+            "neutral_pixels": 0,
+            "candidate_chroma": 0.0,
+            "gains": {
+                "r": 1.0,
+                "g": 1.0,
+                "b": 1.0,
+            },
+            "mean_rgb": {
+                "r": 0.0,
+                "g": 0.0,
+                "b": 0.0,
+            },
+        },
+        "quality": quality,
+        "face": {
+            "bbox": list(
+                new_face.get("bbox")
+                or old_face.get("bbox")
+                or []
+            ),
+            "score": round(
+                float(face_score or 0.0),
+                5,
+            ),
+            "detector": "aggregate",
+            "face_count": int(total_count),
+            "normalized": bool(normalized),
+            "normalized_samples": int(normalized_count),
+        },
+        "reference_count": int(total_count),
+        "aggregation": "equal-image Lab mean",
+    }
+    return result
+
 def preset_summary(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
     quality = ((data.get("reference_model") or {}).get("quality") or {})
     return {
@@ -4089,6 +4888,7 @@ def preset_summary(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": str(data.get("updated_at") or data.get("created_at") or ""),
         "detector": str(((data.get("reference_model") or {}).get("face") or {}).get("detector") or ""),
         "quality_score": float(quality.get("score", 0.0) or 0.0),
+        "reference_count": int(_reference_count(data)),
     }
 
 
@@ -4138,41 +4938,135 @@ def resolve_preset(folder: str, preset_id: str, preset_path: str = "") -> Tuple[
     raise ApiError(f"Preset was not found: {preset_id}", "PRESET_NOT_FOUND")
 
 
-def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, Any]:
+def create_or_update_preset(
+    message: Dict[str, Any],
+    update: bool,
+) -> Dict[str, Any]:
     image_path = str(message.get("image_path") or "")
-    folder = Path(str(message.get("preset_folder") or "")).expanduser()
+    folder = Path(
+        str(message.get("preset_folder") or "")
+    ).expanduser()
     if not image_path or not str(folder):
-        raise ApiError("Image path and preset folder are required.", "INVALID_ARGUMENT")
+        raise ApiError(
+            "Image path and preset folder are required.",
+            "INVALID_ARGUMENT",
+        )
+
     folder.mkdir(parents=True, exist_ok=True)
-    preview_size = int(message.get("preview_size", 1400) or 1400)
-    image = imread_analysis_unicode(image_path, preview_size)
-    model = analyze_face(image)
-    reference_quality = evaluate_reference_quality(model)
+    preview_size = int(
+        message.get("preview_size", 1400) or 1400
+    )
+    image = imread_analysis_unicode(
+        image_path,
+        preview_size,
+    )
+    measured_model = analyze_face(image)
+    sample_quality = evaluate_reference_quality(
+        measured_model
+    )
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    source_entry = {
+        "file_name": str(
+            message.get("source_name")
+            or Path(image_path).name
+        ),
+        "added_at": now,
+        "working_space": "sRGB IEC61966-2.1",
+        "preview_size": [
+            int(image.shape[1]),
+            int(image.shape[0]),
+        ],
+    }
 
     if update:
         preset_id = str(message.get("preset_id") or "")
-        path, old = resolve_preset(str(folder), preset_id, str(message.get("preset_path") or ""))
+        path, old = resolve_preset(
+            str(folder),
+            preset_id,
+            str(message.get("preset_path") or ""),
+        )
         data = old
+        update_mode = str(
+            message.get("update_mode") or "replace"
+        ).lower()
+
+        if update_mode == "average":
+            old_count = _reference_count(data)
+            model = merge_reference_models(
+                data["reference_model"],
+                measured_model,
+                old_count,
+            )
+            reference_count = old_count + 1
+            old_sources = data.get("reference_sources")
+            if isinstance(old_sources, list):
+                sources = list(old_sources)
+            else:
+                old_source = data.get("source") or {}
+                sources = []
+                if old_source:
+                    sources.append({
+                        "file_name": str(
+                            old_source.get("file_name") or ""
+                        ),
+                        "added_at": str(
+                            data.get("created_at") or ""
+                        ),
+                        "working_space": str(
+                            old_source.get(
+                                "working_space",
+                                "sRGB IEC61966-2.1",
+                            )
+                        ),
+                        "preview_size": list(
+                            old_source.get("preview_size") or []
+                        ),
+                    })
+            sources.append(source_entry)
+        elif update_mode == "replace":
+            model = measured_model
+            model["reference_count"] = 1
+            reference_count = 1
+            sources = [source_entry]
+        else:
+            raise ApiError(
+                f"Unsupported preset update mode: {update_mode}",
+                "INVALID_ARGUMENT",
+            )
+
+        reference_quality = evaluate_reference_quality(
+            model
+        )
         data["reference_model"] = model
+        data["reference_count"] = int(reference_count)
+        data["reference_sources"] = sources
         data["reference_quality"] = reference_quality
         data["algorithm_version"] = VERSION
         data["updated_at"] = now
-        data["source"] = {
-            "file_name": str(message.get("source_name") or Path(image_path).name),
-            "working_space": "sRGB IEC61966-2.1",
-            "preview_size": [int(image.shape[1]), int(image.shape[0])],
-        }
+        data["source"] = source_entry
         atomic_json_write(path, data)
+
         return {
             "preset": preset_summary(path, data),
-            "face": model["face"],
+            "face": measured_model["face"],
             "reference_quality": reference_quality,
+            "sample_quality": sample_quality,
+            "update_mode": update_mode,
+            "reference_count": int(reference_count),
         }
 
-    name = str(message.get("name") or "Preset").strip() or "Preset"
+    name = str(
+        message.get("name") or "Preset"
+    ).strip() or "Preset"
     preset_id = uuid.uuid4().hex
-    path = folder / safe_preset_filename(name, preset_id)
+    path = folder / safe_preset_filename(
+        name,
+        preset_id,
+    )
+    measured_model["reference_count"] = 1
+    reference_quality = evaluate_reference_quality(
+        measured_model
+    )
     data = {
         "kind": "face-color-match-preset",
         "format_version": 1,
@@ -4181,19 +5075,19 @@ def create_or_update_preset(message: Dict[str, Any], update: bool) -> Dict[str, 
         "name": name,
         "created_at": now,
         "updated_at": now,
-        "source": {
-            "file_name": str(message.get("source_name") or Path(image_path).name),
-            "working_space": "sRGB IEC61966-2.1",
-            "preview_size": [int(image.shape[1]), int(image.shape[0])],
-        },
-        "reference_model": model,
+        "source": source_entry,
+        "reference_sources": [source_entry],
+        "reference_count": 1,
+        "reference_model": measured_model,
         "reference_quality": reference_quality,
     }
     atomic_json_write(path, data)
     return {
         "preset": preset_summary(path, data),
-        "face": model["face"],
+        "face": measured_model["face"],
         "reference_quality": reference_quality,
+        "sample_quality": sample_quality,
+        "reference_count": 1,
     }
 
 
