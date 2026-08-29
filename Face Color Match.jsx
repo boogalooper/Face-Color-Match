@@ -35,7 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.13.2",
+            version: "0.15.5",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
@@ -628,17 +628,60 @@ function faceColorMatchApplyHistory() {
     }
 
     function applyMatchResultInHistory(result, groupName, opacity) {
+        var doc = app.activeDocument,
+            documentCenter = captureDocumentCenter();
         faceColorMatchHistoryCallback = function () {
             return applyMatchResult(result, groupName, opacity);
         };
         try {
-            app.activeDocument.suspendHistory(
+            doc.suspendHistory(
                 str.historyApplyMatch,
                 "faceColorMatchApplyHistory()"
             );
         } finally {
             faceColorMatchHistoryCallback = null;
+            restoreDocumentCenter(documentCenter);
         }
+    }
+
+    function captureDocumentCenter() {
+        var propertyId = s2t("center"),
+            ref = new ActionReference(),
+            desc;
+        try {
+            ref.putProperty(s2t("property"), propertyId);
+            ref.putEnumerated(
+                s2t("document"),
+                s2t("ordinal"),
+                s2t("targetEnum")
+            );
+            desc = executeActionGet(ref);
+            if (!desc.hasKey(propertyId) ||
+                desc.getType(propertyId) != DescValueType.OBJECTTYPE)
+                return null;
+            return desc.getObjectValue(propertyId);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function restoreDocumentCenter(center) {
+        var propertyId = s2t("center"),
+            ref, desc;
+        if (!center) return;
+        try {
+            ref = new ActionReference();
+            ref.putProperty(s2t("property"), propertyId);
+            ref.putEnumerated(
+                s2t("document"),
+                s2t("ordinal"),
+                s2t("targetEnum")
+            );
+            desc = new ActionDescriptor();
+            desc.putReference(s2t("null"), ref);
+            desc.putObject(s2t("to"), propertyId, center);
+            executeAction(s2t("set"), desc, DialogModes.NO);
+        } catch (_) { }
     }
 
     function layerTitle(result) {
@@ -715,21 +758,60 @@ function faceColorMatchApplyHistory() {
 
     function createPreview(maxSize) {
         var original = app.activeDocument,
+            originalHistoryState = null,
+            originalDocumentCenter = captureDocumentCenter(),
+            operationError = null,
+            restoreError = null,
             file = new File(Folder.temp.fsName + "/face-color-match-" + (new Date()).getTime() + "-" + Math.floor(Math.random() * 1000000) + ".jpg");
         try {
-            var options = new JPEGSaveOptions();
+            var limit = Math.max(640, Math.min(3000, Number(maxSize) || 1400)),
+                width = Number(original.width.as("px")),
+                height = Number(original.height.as("px")),
+                scale = Math.min(1, limit / Math.max(width, height)),
+                options = new JPEGSaveOptions();
+
+            // Work temporarily in the active document to avoid the expensive
+            // duplicate-document operation. The exact starting history state is
+            // restored below even when flatten, resize or JPEG export fails.
+            originalHistoryState = original.activeHistoryState;
+            original.flatten();
+            if (scale < 1) {
+                original.resizeImage(
+                    UnitValue(Math.max(1, Math.round(width * scale)), "px"),
+                    UnitValue(Math.max(1, Math.round(height * scale)), "px"),
+                    null,
+                    ResampleMethod.BICUBICSHARPER
+                );
+            }
+            if (original.bitsPerChannel != BitsPerChannelType.EIGHT)
+                original.bitsPerChannel = BitsPerChannelType.EIGHT;
             options.quality = 12;
             options.embedColorProfile = true;
             options.matte = MatteType.NONE;
             options.formatOptions = FormatOptions.STANDARDBASELINE;
-            // Save a safe flattened copy of the current document without
-            // duplicating it. Python performs any analysis downscale itself.
             original.saveAs(file, options, true, Extension.LOWERCASE);
-            return file;
         } catch (e) {
-            if (file.exists) try { file.remove(); } catch (_) { }
-            throw e;
+            operationError = e;
+        } finally {
+            if (originalHistoryState) {
+                try { original.activeHistoryState = originalHistoryState; }
+                catch (e) { restoreError = e; }
+            }
+            restoreDocumentCenter(originalDocumentCenter);
         }
+
+        if (restoreError) {
+            if (file.exists) try { file.remove(); } catch (_) { }
+            throw new Error(
+                str.previewRestoreFailed + "\n" + errorText(restoreError) +
+                (operationError ? "\n\n" + errorText(operationError) : "")
+            );
+        }
+        if (operationError) {
+            if (file.exists) try { file.remove(); } catch (_) { }
+            throw operationError;
+        }
+        return file;
     }
 
 
@@ -974,14 +1056,24 @@ function faceColorMatchApplyHistory() {
 
     function curveChannel(channel, points) {
         if (!(points instanceof Array) || points.length < 2) points = [[0, 0], [255, 255]];
-        var d = new ActionDescriptor(), ref = new ActionReference(), list = new ActionList(), i, p, pd;
+        if (points.length > 9)
+            throw new Error("Face Color Match: invalid Curves payload for " + channel +
+                " (" + points.length + " control points; maximum is 9).");
+        var d = new ActionDescriptor(), ref = new ActionReference(), list = new ActionList(), i, p, pd,
+            x, y, previousX = -1;
         ref.putEnumerated(c2t("Chnl"), c2t("Chnl"), c2t(channel));
         d.putReference(c2t("Chnl"), ref);
         for (i = 0; i < points.length; i++) {
             p = points[i];
+            x = Number(p[0]);
+            y = Number(p[1]);
+            if (isNaN(x) || isNaN(y) || x <= previousX)
+                throw new Error("Face Color Match: invalid Curves point for " + channel +
+                    " at index " + i + ".");
+            previousX = x;
             pd = new ActionDescriptor();
-            pd.putDouble(c2t("Hrzn"), Math.max(0, Math.min(255, Number(p[0]) || 0)));
-            pd.putDouble(c2t("Vrtc"), Math.max(0, Math.min(255, Number(p[1]) || 0)));
+            pd.putDouble(c2t("Hrzn"), Math.max(0, Math.min(255, x)));
+            pd.putDouble(c2t("Vrtc"), Math.max(0, Math.min(255, y)));
             list.putObject(c2t("Pnt "), pd);
         }
         d.putList(c2t("Crv "), list);
@@ -1614,7 +1706,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Измерить текущий документ и создать новый пресет",
                 strengthHelp: "Общая сила применения найденной коррекции. 100% — полный эффект, меньшие значения ослабляют все созданные корректирующие слои как одну группу.",
                 lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
-                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. Чем дальше в сторону «Точность», тем сильнее алгоритм стремится к минимальному ΔE: плавно ослабляются cross-validation и защита окружающих цветов, расширяется внутренняя доводка и максимальная сила Skin Match растёт до 150%. В сторону «Защита» максимальная сила Skin Match снижается до 60%, а проверки становятся строже.",
+                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. В сторону «Точность» алгоритм сильнее стремится к минимальному ΔE, плавно снижает минимальный требуемый выигрыш и может повышать силу Skin Match до 150%. В крайнем положении LUT принимается при любом измеримом уменьшении ΔE, пока он сохраняет плавность, локальную обратимость и градации. В сторону «Защита» максимальная сила снижается до 60%, а проверки становятся строже.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Измерить текущий документ: добавить его к усреднённому эталону или полностью заменить эталон",
                 presetNamePrompt: "Имя нового пресета:",
@@ -1622,12 +1714,13 @@ function faceColorMatchApplyHistory() {
                 updatePresetPrompt: "Пресет «%s» сейчас содержит %n эталонных измерений.\n\nДобавить текущий документ к эталону и пересчитать среднее значение или полностью заменить эталон текущим документом?",
                 updatePresetAverage: "Добавить и усреднить",
                 updatePresetReplace: "Заменить",
-                updatePresetAverageHelp: "Текущий документ станет ещё одним равноправным эталоном; соответствующие измерения кожи будут усреднены в Lab.",
+                updatePresetAverageHelp: "Текущий документ будет сохранён как отдельное измерение эталона; итог пересчитается в Lab с учётом качества и устойчивым подавлением выбросов.",
                 updatePresetReplaceHelp: "Удалить накопленное усреднение и сделать текущий документ единственным эталоном.",
                 referenceQualityWarning: "Образец сохранён, но его цвет может быть нестабильным для точного совпадения:",
                 referenceIssue_few_zones: "мало надёжно измеренных зон кожи",
                 referenceIssue_low_coverage: "слишком мало пригодных пикселей кожи",
                 referenceIssue_low_mask_quality: "низкая уверенность маски кожи",
+                referenceIssue_insufficient_skin_mask: "надёжная маска кожи получилась слишком маленькой",
                 referenceIssue_uneven_cheeks: "левая и правая щека заметно различаются по цвету",
                 referenceIssue_high_spread: "в измерениях кожи слишком большой разброс",
                 referenceIssue_clipping: "часть измерений близка к клиппингу каналов",
@@ -1671,7 +1764,8 @@ function faceColorMatchApplyHistory() {
                 lutReadFailed: "Не удалось прочитать LUT.",
                 lutProfileReadFailed: "Не удалось прочитать ICC profile LUT.",
                 lutProfileInvalid: "ICC profile LUT повреждён или слишком мал.",
-                selectionPreserveFailed: "Не удалось безопасно сохранить активное выделение. Коррекция отменена."
+                selectionPreserveFailed: "Не удалось безопасно сохранить активное выделение. Коррекция отменена.",
+                previewRestoreFailed: "Не удалось вернуть исходное состояние документа после подготовки изображения."
             },
             E = {
                 noDocument: "No document is open.",
@@ -1690,7 +1784,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Measure the current document and create a new preset",
                 strengthHelp: "Overall strength of the fitted correction. 100% keeps the full effect; lower values reduce the opacity of the created adjustment group.",
                 lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
-                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Moving toward Accuracy progressively prioritizes minimum ΔE: cross-validation and surrounding-colour protection are relaxed, internal refinement gets more freedom, and maximum Skin Match strength rises to 150%. Moving toward Safety reduces maximum Skin Match strength to 60% and makes validation stricter.",
+                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Toward Accuracy, the algorithm prioritizes minimum ΔE, progressively lowers the required gain and may raise Skin Match up to 150%. At maximum Accuracy, any measurable ΔE reduction is accepted while the LUT must remain smooth, locally invertible and gradation-safe. Safety lowers the maximum to 60% and tightens validation.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Measure the current document: add it to the averaged reference or replace the reference completely",
                 presetNamePrompt: "New preset name:",
@@ -1698,12 +1792,13 @@ function faceColorMatchApplyHistory() {
                 updatePresetPrompt: "Preset “%s” currently contains %n reference measurements.\n\nAdd the current document as another reference and recalculate the average, or replace the reference completely with the current document?",
                 updatePresetAverage: "Add and average",
                 updatePresetReplace: "Replace",
-                updatePresetAverageHelp: "The current document becomes another equally weighted reference; corresponding skin measurements are averaged in Lab.",
+                updatePresetAverageHelp: "The current document is retained as a separate reference measurement; the Lab target is rebuilt with quality weighting and robust outlier suppression.",
                 updatePresetReplaceHelp: "Discard the accumulated average and make the current document the only reference.",
                 referenceQualityWarning: "The reference was saved, but its color may be unstable for precise matching:",
                 referenceIssue_few_zones: "too few reliable skin zones were measured",
                 referenceIssue_low_coverage: "too few usable skin pixels",
                 referenceIssue_low_mask_quality: "low skin-mask confidence",
+                referenceIssue_insufficient_skin_mask: "the reliable skin mask is too small",
                 referenceIssue_uneven_cheeks: "left and right cheek colors differ substantially",
                 referenceIssue_high_spread: "skin measurements have excessive spread",
                 referenceIssue_clipping: "some measurements are close to channel clipping",
@@ -1746,7 +1841,8 @@ function faceColorMatchApplyHistory() {
                 lutProfileMissing: "The temporary LUT ICC profile was not found.",
                 lutReadFailed: "Could not read the LUT.",
                 lutProfileReadFailed: "Could not read the LUT ICC profile.",
-                lutProfileInvalid: "The LUT ICC profile is invalid or truncated."
+                lutProfileInvalid: "The LUT ICC profile is invalid or truncated.",
+                previewRestoreFailed: "Could not restore the document after preparing the analysis image."
             },
             key,
             source = ru ? R : E;
