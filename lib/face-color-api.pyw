@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -561,6 +561,153 @@ def detect_faces(image: np.ndarray) -> List[Dict[str, Any]]:
     return faces
 
 
+
+FACE_SELECTION_MAIN = "main"
+FACE_SELECTION_CENTRAL_AVERAGE = "central_average"
+CENTRAL_AVERAGE_MAX_FACES = 3
+CENTRAL_AVERAGE_MAX_DISTANCE = 0.34
+CENTRAL_AVERAGE_FALLBACK_DISTANCE = 0.45
+CENTRAL_AVERAGE_MIN_RELATIVE_AREA = 0.22
+
+
+def _normalize_face_selection_mode(value: Any) -> str:
+    mode = str(value or FACE_SELECTION_MAIN).strip().lower()
+    if mode == FACE_SELECTION_CENTRAL_AVERAGE:
+        return FACE_SELECTION_CENTRAL_AVERAGE
+    return FACE_SELECTION_MAIN
+
+
+def _face_center_distance(
+    face: Dict[str, Any],
+    image_shape: Sequence[int],
+) -> float:
+    h, w = int(image_shape[0]), int(image_shape[1])
+    x, y, fw, fh = [float(v) for v in face["bbox"]]
+    fx = x + fw * 0.5
+    fy = y + fh * 0.5
+    return float(math.hypot(
+        (fx - w * 0.5) / max(float(w), 1.0),
+        (fy - h * 0.5) / max(float(h), 1.0),
+    ))
+
+
+def _face_area(face: Dict[str, Any]) -> float:
+    x, y, fw, fh = [float(v) for v in face["bbox"]]
+    return float(max(1.0, fw * fh))
+
+
+def _union_face_bbox(
+    faces: Sequence[Dict[str, Any]],
+) -> List[float]:
+    if not faces:
+        return []
+    xs: List[float] = []
+    ys: List[float] = []
+    x2s: List[float] = []
+    y2s: List[float] = []
+    for face in faces:
+        x, y, w, h = [float(v) for v in face["bbox"]]
+        xs.append(x)
+        ys.append(y)
+        x2s.append(x + w)
+        y2s.append(y + h)
+    x0 = min(xs)
+    y0 = min(ys)
+    x1 = max(x2s)
+    y1 = max(y2s)
+    return [
+        round(float(x0), 3),
+        round(float(y0), 3),
+        round(float(max(0.0, x1 - x0)), 3),
+        round(float(max(0.0, y1 - y0)), 3),
+    ]
+
+
+def _select_faces_for_analysis(
+    faces: Sequence[Dict[str, Any]],
+    image_shape: Sequence[int],
+    face_selection_mode: Any = None,
+) -> List[Dict[str, Any]]:
+    if not faces:
+        return []
+
+    mode = _normalize_face_selection_mode(
+        face_selection_mode
+    )
+    ordered = list(faces)
+    if mode == FACE_SELECTION_MAIN or len(ordered) <= 1:
+        return [ordered[0]]
+
+    max_area = max(_face_area(face) for face in ordered)
+    ranked: List[Tuple[float, float, float, Dict[str, Any]]] = []
+    fallback_ranked: List[
+        Tuple[float, float, float, Dict[str, Any]]
+    ] = []
+
+    for face in ordered:
+        area = _face_area(face)
+        area_ratio = area / max(max_area, 1.0)
+        dist = _face_center_distance(face, image_shape)
+        size_factor = math.sqrt(
+            max(0.0, min(1.0, area_ratio))
+        )
+        centrality = max(
+            0.0,
+            1.0 - dist / max(
+                CENTRAL_AVERAGE_MAX_DISTANCE,
+                1e-6,
+            ),
+        )
+        score = centrality * (0.78 + 0.22 * size_factor)
+        item = (score, dist, -area, face)
+
+        if (
+            dist <= CENTRAL_AVERAGE_MAX_DISTANCE
+            and area_ratio
+                >= CENTRAL_AVERAGE_MIN_RELATIVE_AREA
+        ):
+            ranked.append(item)
+
+        if (
+            dist <= CENTRAL_AVERAGE_FALLBACK_DISTANCE
+            and area_ratio >= 0.16
+        ):
+            fallback_ranked.append(item)
+
+    if not ranked:
+        ranked = fallback_ranked or [
+            (
+                0.0,
+                _face_center_distance(face, image_shape),
+                -_face_area(face),
+                face,
+            )
+            for face in ordered
+        ]
+
+    ranked.sort(
+        key=lambda item: (
+            -float(item[0]),
+            float(item[1]),
+            float(item[2]),
+        )
+    )
+    selected = [
+        item[3]
+        for item in ranked[
+            : max(1, int(CENTRAL_AVERAGE_MAX_FACES))
+        ]
+    ]
+
+    selected.sort(
+        key=lambda face: _face_center_distance(
+            face,
+            image_shape,
+        )
+    )
+    return selected
+
+
 def canonical_face_patch(image: np.ndarray, face: Dict[str, Any], size: int = 256) -> Tuple[np.ndarray, List[List[float]]]:
     """Normalize scale/roll from YuNet landmarks before sampling skin zones."""
     landmarks = face.get("landmarks") or []
@@ -816,11 +963,11 @@ def _anchors_from_pixels(pixels: np.ndarray) -> List[Dict[str, Any]]:
     return result
 
 
-def analyze_face(image: np.ndarray) -> Dict[str, Any]:
-    faces = detect_faces(image)
-    if not faces:
-        raise ApiError("No face was found in the image.", "NO_FACE")
-    face = faces[0]
+def _analyze_single_detected_face(
+    image: np.ndarray,
+    face: Dict[str, Any],
+    detected_face_count: int,
+) -> Tuple[Dict[str, Any], np.ndarray]:
     ih, iw = image.shape[:2]
     bx, by, bw, bh = [float(v) for v in face["bbox"]]
     bx = max(0.0, bx)
@@ -828,12 +975,22 @@ def analyze_face(image: np.ndarray) -> Dict[str, Any]:
     bw = min(float(iw) - bx, bw)
     bh = min(float(ih) - by, bh)
     if bw < 32 or bh < 32:
-        raise ApiError("The detected face is too small for reliable color measurement.", "FACE_TOO_SMALL")
+        raise ApiError(
+            "The detected face is too small for reliable color measurement.",
+            "FACE_TOO_SMALL",
+        )
 
-    patch_bgr, canonical_landmarks = canonical_face_patch(image, face, 256)
+    patch_bgr, canonical_landmarks = canonical_face_patch(
+        image,
+        face,
+        256,
+    )
     h, w = patch_bgr.shape[:2]
     rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
-    skin_mask, zone_masks, quality = _skin_mask_from_patch(rgb, canonical_landmarks)
+    skin_mask, zone_masks, quality = _skin_mask_from_patch(
+        rgb,
+        canonical_landmarks,
+    )
     zones: Dict[str, Any] = {}
     all_zone_pixels: List[np.ndarray] = []
     seed_lab = None
@@ -842,40 +999,176 @@ def analyze_face(image: np.ndarray) -> Dict[str, Any]:
         seed_lab = _lab_pixels_from_rgb(pooled_seed_pixels)
 
     for name in ZONE_DEFS.keys():
-        zone_mask = ((zone_masks.get(name, np.zeros((h, w), dtype=np.uint8)) > 0) & (skin_mask > 0)).astype(np.uint8)
-        pixels = _finalize_skin_pixels(rgb, zone_mask, seed_lab)
-        if pixels.shape[0] < 25 and np.count_nonzero(zone_mask) >= 25:
+        zone_mask = (
+            (
+                zone_masks.get(
+                    name,
+                    np.zeros((h, w), dtype=np.uint8),
+                ) > 0
+            )
+            & (skin_mask > 0)
+        ).astype(np.uint8)
+        pixels = _finalize_skin_pixels(
+            rgb,
+            zone_mask,
+            seed_lab,
+        )
+        if (
+            pixels.shape[0] < 25
+            and np.count_nonzero(zone_mask) >= 25
+        ):
             pixels = _robust_pixels(rgb, zone_mask)
         anchors = _anchors_from_pixels(pixels)
         if anchors:
-            zones[name] = {"anchors": anchors, "pixels": int(pixels.shape[0])}
+            zones[name] = {
+                "anchors": anchors,
+                "pixels": int(pixels.shape[0]),
+            }
             all_zone_pixels.append(pixels)
 
     if len(zones) < 2:
-        raise ApiError("The face was found, but there are not enough reliable skin regions to measure.", "INSUFFICIENT_SKIN")
+        raise ApiError(
+            "The face was found, but there are not enough reliable skin regions to measure.",
+            "INSUFFICIENT_SKIN",
+        )
 
     if all_zone_pixels:
         pooled = np.concatenate(all_zone_pixels, axis=0)
     else:
         pooled = rgb[skin_mask.astype(bool)]
-    pooled = pooled if pooled.size else np.empty((0, 3), dtype=np.uint8)
+    pooled = (
+        pooled
+        if pooled.size
+        else np.empty((0, 3), dtype=np.uint8)
+    )
     pooled_anchors = _anchors_from_pixels(pooled)
     full_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    white_balance = _estimate_global_white_balance(full_rgb, pooled)
-    return {
+    white_balance = _estimate_global_white_balance(
+        full_rgb,
+        pooled,
+    )
+    result = {
         "zones": zones,
-        "pooled": {"anchors": pooled_anchors, "pixels": int(pooled.shape[0])},
+        "pooled": {
+            "anchors": pooled_anchors,
+            "pixels": int(pooled.shape[0]),
+        },
         "white_balance": white_balance,
         "quality": quality,
         "face": {
-            "bbox": [round(float(v), 3) for v in [bx, by, bw, bh]],
-            "score": round(float(face.get("score", 0.0)), 5),
-            "detector": str(face.get("detector") or "unknown"),
-            "face_count": len(faces),
+            "bbox": [
+                round(float(v), 3)
+                for v in [bx, by, bw, bh]
+            ],
+            "score": round(
+                float(face.get("score", 0.0)),
+                5,
+            ),
+            "detector": str(
+                face.get("detector") or "unknown"
+            ),
+            "face_count": int(detected_face_count),
             "normalized": bool(canonical_landmarks),
+            "center_distance": round(
+                _face_center_distance(face, image.shape),
+                5,
+            ),
         },
     }
+    return result, pooled
 
+
+def analyze_face(
+    image: np.ndarray,
+    face_selection_mode: Any = None,
+) -> Dict[str, Any]:
+    faces = detect_faces(image)
+    if not faces:
+        raise ApiError(
+            "No face was found in the image.",
+            "NO_FACE",
+        )
+
+    mode = _normalize_face_selection_mode(
+        face_selection_mode
+    )
+    selected_faces = _select_faces_for_analysis(
+        faces,
+        image.shape,
+        mode,
+    )
+    if not selected_faces:
+        selected_faces = [faces[0]]
+
+    measured_models: List[Dict[str, Any]] = []
+    pooled_sets: List[np.ndarray] = []
+    for face in selected_faces:
+        model, pooled = _analyze_single_detected_face(
+            image,
+            face,
+            len(faces),
+        )
+        measured_models.append(model)
+        if pooled.size:
+            pooled_sets.append(pooled)
+
+    if len(measured_models) == 1:
+        result = measured_models[0]
+        result_face = dict(result.get("face") or {})
+        result_face["selection_mode"] = mode
+        result_face["selected_face_count"] = 1
+        result_face["detected_face_count"] = int(len(faces))
+        result["face"] = result_face
+        return result
+
+    merged = measured_models[0]
+    merged_count = 1
+    for model in measured_models[1:]:
+        merged = merge_reference_models(
+            merged,
+            model,
+            merged_count,
+        )
+        merged_count += 1
+
+    full_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pooled_pixels = (
+        np.concatenate(pooled_sets, axis=0)
+        if pooled_sets else np.empty((0, 3), dtype=np.uint8)
+    )
+    merged["white_balance"] = _estimate_global_white_balance(
+        full_rgb,
+        pooled_pixels,
+    )
+
+    normalized_samples = int(sum(
+        1
+        for model in measured_models
+        if bool(
+            (model.get("face") or {}).get("normalized")
+        )
+    ))
+    avg_score = float(np.mean([
+        float((model.get("face") or {}).get("score", 0.0))
+        for model in measured_models
+    ]))
+    merged["face"] = {
+        "bbox": _union_face_bbox(selected_faces),
+        "score": round(avg_score, 5),
+        "detector": "central-average",
+        "face_count": int(len(faces)),
+        "normalized": bool(
+            normalized_samples * 2
+            >= len(measured_models)
+        ),
+        "normalized_samples": int(normalized_samples),
+        "selection_mode": mode,
+        "selected_face_count": int(
+            len(measured_models)
+        ),
+        "detected_face_count": int(len(faces)),
+    }
+    return merged
 
 
 def evaluate_reference_quality(model: Dict[str, Any]) -> Dict[str, Any]:
@@ -4960,7 +5253,13 @@ def create_or_update_preset(
         image_path,
         preview_size,
     )
-    measured_model = analyze_face(image)
+    face_selection_mode = _normalize_face_selection_mode(
+        message.get("face_selection_mode")
+    )
+    measured_model = analyze_face(
+        image,
+        face_selection_mode,
+    )
     sample_quality = evaluate_reference_quality(
         measured_model
     )
@@ -5101,10 +5400,16 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
     preview_size = int(message.get("preview_size", 1400) or 1400)
     lightness_balance = float(message.get("lightness_balance", 0.0) or 0.0)
     protection_bias = float(message.get("protection_bias", 0.0) or 0.0)
+    face_selection_mode = _normalize_face_selection_mode(
+        message.get("face_selection_mode")
+    )
 
     path, preset = resolve_preset(preset_folder, preset_id, preset_path)
     image = imread_analysis_unicode(image_path, preview_size)
-    target_model = analyze_face(image)
+    target_model = analyze_face(
+        image,
+        face_selection_mode,
+    )
     rows = build_correspondences(
         target_model, preset["reference_model"]
     )

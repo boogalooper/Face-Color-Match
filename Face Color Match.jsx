@@ -11,6 +11,7 @@
             /strength [(strength) /integer]
             /lightnessBalance [(lightness balance) /integer]
             /protectionBias [(accuracy safety balance) /integer]
+            /faceSelectionMode [(face selection mode) /string]
             /layerName [(layer name) /string]
             /skipNoFace [(skip if no face) /boolean]
         >>]
@@ -34,7 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.11.1",
+            version: "0.12.0",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -239,6 +240,9 @@ function faceColorMatchApplyHistory() {
             ddPreset = presetGroup.add("dropdownlist"),
             bAdd = presetGroup.add("button", undefined, "+"),
             bUpdate = presetGroup.add("button", undefined, "↻"),
+            faceModeGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
+            tFaceMode = faceModeGroup.add("statictext", undefined, str.faceSelectionMode),
+            ddFaceMode = faceModeGroup.add("dropdownlist"),
             strengthGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             tStrength = strengthGroup.add("statictext", undefined, str.strength),
             slStrength = strengthGroup.add("slider", undefined, cfg.data.strength, 0, 100),
@@ -262,10 +266,12 @@ function faceColorMatchApplyHistory() {
         bSettings.alignment = ["right", "center"];
         ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
         ui.setFixedWidth(tPreset, ui.labelWidth);
+        ui.setFixedWidth(tFaceMode, ui.labelWidth);
         ui.setFixedWidth(tStrength, ui.labelWidth);
         ui.setFixedWidth(tTone, ui.labelWidth);
         ui.setFixedWidth(tProtection, ui.labelWidth);
         ui.setFixedWidth(ddPreset, 150);
+        ui.setFixedWidth(ddFaceMode, 150);
         ui.setFixedWidth(slStrength, ui.sliderWidth);
         ui.setFixedWidth(slTone, ui.sliderWidth);
         ui.setFixedWidth(slProtection, ui.sliderWidth);
@@ -277,6 +283,7 @@ function faceColorMatchApplyHistory() {
         bSettings.helpTip = str.settings;
         bAdd.helpTip = str.createPresetHelp;
         bUpdate.helpTip = str.updatePresetHelp;
+        tFaceMode.helpTip = ddFaceMode.helpTip = str.faceSelectionModeHelp;
         tStrength.helpTip = slStrength.helpTip = tStrengthValue.helpTip = str.strengthHelp;
         tTone.helpTip = slTone.helpTip = tToneValue.helpTip = str.lightnessBalanceHelp;
         tProtection.helpTip = slProtection.helpTip = tProtectionValue.helpTip = str.protectionBiasHelp;
@@ -301,6 +308,18 @@ function faceColorMatchApplyHistory() {
             state.presets = api.listPresets(cfg.data.presetFolder);
             repopulate(selectId);
         }
+        function repopulateFaceMode() {
+            ddFaceMode.removeAll();
+            var itemMain = ddFaceMode.add("item", str.faceModeMain),
+                itemAverage = ddFaceMode.add("item", str.faceModeCentralAverage),
+                value = String(cfg.data.faceSelectionMode || "main");
+            itemMain.modeValue = "main";
+            itemAverage.modeValue = "central_average";
+            if (value == "central_average")
+                ddFaceMode.selection = itemAverage;
+            else
+                ddFaceMode.selection = itemMain;
+        }
         function syncToneText(finalize) {
             var pointerActive = toneStepper.pointerActive,
                 value = finalize ? toneStepper.finish() : toneStepper.sync(false);
@@ -322,6 +341,7 @@ function faceColorMatchApplyHistory() {
             tProtectionValue.text = ui.centeredSliderText(value);
         }
         repopulate(cfg.data.selectedPresetId);
+        repopulateFaceMode();
         toneStepper.reset(Number(cfg.data.lightnessBalance) || 0);
         protectionStepper.reset(Number(cfg.data.protectionBias) || 0);
         syncToneText(false);
@@ -330,6 +350,10 @@ function faceColorMatchApplyHistory() {
         ddPreset.onChange = function () {
             var item = selectedPreset();
             if (item) cfg.data.selectedPresetId = String(item.id || "");
+        };
+        ddFaceMode.onChange = function () {
+            if (ddFaceMode.selection)
+                cfg.data.faceSelectionMode = String(ddFaceMode.selection.modeValue || "main");
         };
         slStrength.onChanging = function () { tStrengthValue.text = String(Math.round(slStrength.value)) + "%"; };
         slStrength.onChange = function () { cfg.data.strength = Math.round(slStrength.value); tStrengthValue.text = String(cfg.data.strength) + "%"; };
@@ -349,7 +373,7 @@ function faceColorMatchApplyHistory() {
                     setProgress(str.progressPreparePreview, 20);
                     return withPreview(function (file) {
                         setProgress(str.progressMeasureReference, 55);
-                        return api.createPreset(file.fsName, cfg.data.presetFolder, name, app.activeDocument.name, cfg.data.previewSize);
+                        return api.createPreset(file.fsName, cfg.data.presetFolder, name, app.activeDocument.name, cfg.data.previewSize, cfg.data.faceSelectionMode);
                     });
                 });
                 refreshPresets(result && result.preset ? result.preset.id : "");
@@ -374,7 +398,8 @@ function faceColorMatchApplyHistory() {
                             item.path,
                             app.activeDocument.name,
                             cfg.data.previewSize,
-                            updateMode
+                            updateMode,
+                            cfg.data.faceSelectionMode
                         );
                     });
                 });
@@ -408,6 +433,8 @@ function faceColorMatchApplyHistory() {
             if (!item) return;
             cfg.data.selectedPresetId = String(item.id || "");
             cfg.data.strength = Math.round(slStrength.value);
+            if (ddFaceMode.selection)
+                cfg.data.faceSelectionMode = String(ddFaceMode.selection.modeValue || "main");
             syncToneText(true);
             syncProtectionText(true);
             w.close(1);
@@ -1074,16 +1101,17 @@ function faceColorMatchApplyHistory() {
             var result = call("list_presets", { preset_folder: folder }, 10000);
             return result && result.presets instanceof Array ? result.presets : [];
         };
-        this.createPreset = function (imagePath, folder, name, sourceName, previewSize) {
+        this.createPreset = function (imagePath, folder, name, sourceName, previewSize, faceSelectionMode) {
             return call("create_preset", {
                 image_path: imagePath,
                 preset_folder: folder,
                 name: name,
                 source_name: sourceName,
-                preview_size: parseInt(previewSize, 10) || 1400
+                preview_size: parseInt(previewSize, 10) || 1400,
+                face_selection_mode: String(faceSelectionMode || "main")
             }, 45000);
         };
-        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName, previewSize, updateMode) {
+        this.updatePreset = function (imagePath, folder, presetId, presetPath, sourceName, previewSize, updateMode, faceSelectionMode) {
             return call("update_preset", {
                 image_path: imagePath,
                 preset_folder: folder,
@@ -1091,7 +1119,8 @@ function faceColorMatchApplyHistory() {
                 preset_path: presetPath,
                 source_name: sourceName,
                 preview_size: parseInt(previewSize, 10) || 1400,
-                update_mode: String(updateMode || "replace")
+                update_mode: String(updateMode || "replace"),
+                face_selection_mode: String(faceSelectionMode || "main")
             }, 45000);
         };
         this.deletePreset = function (folder, presetId, presetPath) {
@@ -1104,7 +1133,8 @@ function faceColorMatchApplyHistory() {
                 preset_id: data.selectedPresetId,
                 preview_size: parseInt(data.previewSize, 10) || 1400,
                 lightness_balance: parseInt(data.lightnessBalance, 10) || 0,
-                protection_bias: parseInt(data.protectionBias, 10) || 0
+                protection_bias: parseInt(data.protectionBias, 10) || 0,
+                face_selection_mode: String(data.faceSelectionMode || "main")
             }, 45000);
         };
         function call(type, message, timeout) {
@@ -1207,11 +1237,12 @@ function faceColorMatchApplyHistory() {
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 8,
+                actionDataVersion: 9,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
                 strength: Math.round(strength),
                 lightnessBalance: Math.round(Number(cfg.data.lightnessBalance) || 0),
                 protectionBias: Math.round(Number(cfg.data.protectionBias) || 0),
+                faceSelectionMode: String(cfg.data.faceSelectionMode || "main"),
                 layerName: String(cfg.data.layerName || "Face Color Match"),
                 skipNoFace: !!cfg.data.skipNoFace
             };
@@ -1264,6 +1295,8 @@ function faceColorMatchApplyHistory() {
                 cfg.data.lightnessBalance = Number(values.lightnessBalance);
             if (values.protectionBias !== undefined)
                 cfg.data.protectionBias = Number(values.protectionBias);
+            if (values.faceSelectionMode !== undefined)
+                cfg.data.faceSelectionMode = String(values.faceSelectionMode || "main");
             if (values.layerName !== undefined)
                 cfg.data.layerName = String(values.layerName || "Face Color Match");
             if (values.skipNoFace !== undefined)
@@ -1427,7 +1460,7 @@ function faceColorMatchApplyHistory() {
     }
 
     function Config() {
-        var SETTINGS_VERSION = 9;
+        var SETTINGS_VERSION = 10;
         this.data = defaults();
 
         this.load = function () {
@@ -1458,6 +1491,7 @@ function faceColorMatchApplyHistory() {
                 loaded.strength === undefined ||
                 loaded.lightnessBalance === undefined ||
                 loaded.protectionBias === undefined ||
+                loaded.faceSelectionMode === undefined ||
                 loaded.layerName === undefined ||
                 loaded.skipNoFace === undefined
             ) return;
@@ -1538,6 +1572,9 @@ function faceColorMatchApplyHistory() {
                     Math.round(Number(d.protectionBias) || 0)
                 )
             );
+            d.faceSelectionMode = String(d.faceSelectionMode || "main");
+            if (d.faceSelectionMode != "central_average")
+                d.faceSelectionMode = "main";
             d.skipNoFace = !!d.skipNoFace;
         }
 
@@ -1557,6 +1594,7 @@ function faceColorMatchApplyHistory() {
             R = {
                 noDocument: "Нет открытого документа.",
                 preset: "Пресет",
+                faceSelectionMode: "Лицо",
                 strength: "Сила",
                 lightnessBalance: "Тени / света",
                 protectionBias: "Точность / защита",
@@ -1627,6 +1665,7 @@ function faceColorMatchApplyHistory() {
             E = {
                 noDocument: "No document is open.",
                 preset: "Preset",
+                faceSelectionMode: "Face",
                 strength: "Strength",
                 lightnessBalance: "Shadows / highlights",
                 protectionBias: "Accuracy / safety",
