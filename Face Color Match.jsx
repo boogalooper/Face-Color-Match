@@ -35,7 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.15.5",
+            version: "0.15.7",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
@@ -65,6 +65,8 @@ function faceColorMatchApplyHistory() {
 
     function init() {
         if (!app.documents.length) throw new Error(str.noDocument);
+        if (app.activeDocument.mode != DocumentMode.RGB)
+            throw new Error(str.rgbDocumentRequired);
         cfg.load();
         cfg.ensurePresetFolder();
 
@@ -1232,7 +1234,10 @@ function faceColorMatchApplyHistory() {
                 lightness_balance: parseInt(data.lightnessBalance, 10) || 0,
                 protection_bias: parseInt(data.protectionBias, 10) || 0,
                 face_selection_mode: String(data.faceSelectionMode || "main")
-            }, 45000);
+            // Accuracy computes a full endpoint before interpolating the
+            // requested value.  Keep the listener alive on slower CPUs rather
+            // than timing out while the local server is still working normally.
+            }, 180000);
         };
         function call(type, message, timeout) {
             var requestId = makeRequestId(), listener = new Socket(), sender = null, answer = null, started = (new Date()).getTime();
@@ -1691,6 +1696,7 @@ function faceColorMatchApplyHistory() {
                 .toLowerCase().indexOf("ru") === 0,
             R = {
                 noDocument: "Нет открытого документа.",
+                rgbDocumentRequired: "Face Color Match работает только с документами RGB.",
                 preset: "Пресет",
                 faceSelectionMode: "Лицо",
                 faceModeMain: "Основное лицо",
@@ -1769,6 +1775,7 @@ function faceColorMatchApplyHistory() {
             },
             E = {
                 noDocument: "No document is open.",
+                rgbDocumentRequired: "Face Color Match requires an RGB document.",
                 preset: "Preset",
                 faceSelectionMode: "Face",
                 faceModeMain: "Main face",

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.15.5"
+VERSION = "0.15.7"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -2997,315 +2997,22 @@ def _smooth_skin_base_delta_lab(
     ], dtype=np.float64)
 
 
-def _smooth_skin_rbf_delta_lab(
-    lab: Sequence[float],
-    model: Dict[str, Any],
-) -> np.ndarray:
-    centers_value = model.get("rbf_centers")
-    residuals_value = model.get("rbf_residuals")
-    if centers_value is None or residuals_value is None:
-        return np.zeros(3, dtype=np.float64)
-
-    centers = np.asarray(centers_value, dtype=np.float64)
-    residuals = np.asarray(residuals_value, dtype=np.float64)
-    if centers.ndim != 2 or centers.shape[0] == 0:
-        return np.zeros(3, dtype=np.float64)
-
-    labv = np.asarray(lab, dtype=np.float64).reshape(1, 3)
-    diff = centers - labv
-    dl = diff[:, 0] / max(1e-6, float(model.get("rbf_sigma_l", 9.0)))
-    da = diff[:, 1] / max(1e-6, float(model.get("rbf_sigma_ab", 11.5)))
-    db = diff[:, 2] / max(1e-6, float(model.get("rbf_sigma_ab", 11.5)))
-    distance2 = dl * dl + da * da + db * db
-
-    weights_value = model.get("weights")
-    if weights_value is None:
-        weights = np.ones(centers.shape[0], dtype=np.float64)
-    else:
-        weights = np.asarray(weights_value, dtype=np.float64)
-    weights = weights / max(1e-9, float(np.max(weights)))
-
-    kernel = weights * np.exp(-0.5 * distance2)
-    support = float(np.sum(kernel))
-    if support <= 1e-9:
-        return np.zeros(3, dtype=np.float64)
-
-    return (
-        np.sum(kernel[:, None] * residuals, axis=0)
-        / (support + 0.55)
-    )
-
-
-def _smooth_skin_gate(
-    lab: Sequence[float],
-    model: Dict[str, Any],
-) -> float:
-    labv = np.asarray(lab, dtype=np.float64)
-
-    ab_delta = labv[1:3] - np.asarray(model["ab_center"], dtype=np.float64)
-    mahal2 = float(ab_delta.T @ np.asarray(model["inv_cov"]) @ ab_delta)
-    gamut_gate = math.exp(-0.5 * mahal2 / (2.70 ** 2))
-
-    src_lab = np.asarray(model["src_lab"], dtype=np.float64)
-    scaled = src_lab - labv.reshape(1, 3)
-    scaled[:, 0] *= 0.70
-    nearest = float(np.min(np.sqrt(np.sum(scaled ** 2, axis=1))))
-    nearest_gate = math.exp(-0.5 * (nearest / 22.0) ** 2)
-
-    chroma = float(math.hypot(labv[1], labv[2]))
-    neutral_gate = float(
-        _smoothstep(np.asarray([chroma]), 4.5, 12.5)[0]
-    )
-
-    # One colour-membership confidence instead of repeatedly multiplying
-    # several similar colour-distance gates. This avoids unintended rapid
-    # attenuation on perfectly plausible neighbouring skin colours.
-    color_membership = math.sqrt(
-        max(0.0, gamut_gate) * max(0.0, nearest_gate)
-    ) * neutral_gate
-
-    l_low = float(model["l_low"])
-    l_high = float(model["l_high"])
-    l_range_gate = (
-        float(_smoothstep(np.asarray([labv[0]]), l_low, l_low + 9.0)[0])
-        * (
-            1.0
-            - float(_smoothstep(
-                np.asarray([labv[0]]),
-                l_high - 9.0,
-                l_high,
-            )[0])
-        )
-    )
-    shadow_gate = (
-        0.12 * float(_smoothstep(np.asarray([labv[0]]), 18.0, 30.0)[0])
-        + 0.88 * float(_smoothstep(np.asarray([labv[0]]), 30.0, 55.0)[0])
-    )
-    highlight_gate = 1.0 - 0.82 * float(
-        _smoothstep(np.asarray([labv[0]]), 93.0, 99.5)[0]
-    )
-    tonal_membership = min(
-        l_range_gate,
-        shadow_gate,
-        highlight_gate,
-    )
-
-    return float(np.clip(
-        color_membership * tonal_membership,
-        0.0,
-        1.0,
-    ))
 
 
 
-def _smooth_skin_lightness_gate(
-    lab: Sequence[float],
-    model: Dict[str, Any],
-) -> float:
-    """Broad membership for smooth residual ΔL*, never a local tone mask."""
-    labv = np.asarray(lab, dtype=np.float64)
-
-    ab_delta = (
-        labv[1:3]
-        - np.asarray(model["ab_center"], dtype=np.float64)
-    )
-    mahal2 = float(
-        ab_delta.T
-        @ np.asarray(model["inv_cov"], dtype=np.float64)
-        @ ab_delta
-    )
-    gamut_gate = math.exp(-0.5 * mahal2 / (3.25 ** 2))
-
-    src_lab = np.asarray(model["src_lab"], dtype=np.float64)
-    ab_distance = np.sqrt(np.sum(
-        (src_lab[:, 1:3] - labv[1:3].reshape(1, 2)) ** 2,
-        axis=1,
-    ))
-    nearest_ab = float(np.min(ab_distance))
-    nearest_gate = math.exp(-0.5 * (nearest_ab / 19.0) ** 2)
-
-    chroma = float(math.hypot(labv[1], labv[2]))
-    neutral_gate = float(
-        _smoothstep(np.asarray([chroma]), 4.5, 12.0)[0]
-    )
-    color_membership = math.sqrt(
-        max(0.0, gamut_gate) * max(0.0, nearest_gate)
-    ) * neutral_gate
-
-    shadow_gate = float(
-        _smoothstep(np.asarray([labv[0]]), 22.0, 44.0)[0]
-    )
-    return float(np.clip(
-        color_membership * shadow_gate,
-        0.0,
-        1.0,
-    ))
 
 
 
-def _smooth_skin_delta_lab(
-    lab: Sequence[float],
-    model: Dict[str, Any],
-) -> np.ndarray:
-    base = _smooth_skin_base_delta_lab(lab, model)
-    rbf = _smooth_skin_rbf_delta_lab(lab, model)
-    combined = base + rbf
-
-    lightness_cap = max(0.0, float(model.get("max_delta_l", 3.2)))
-    combined[0] = float(np.clip(combined[0], -lightness_cap, lightness_cap))
-    if combined[0] > 0.0:
-        combined[0] *= _shadow_lightening_gate(float(np.asarray(lab)[0]))
-    combined[1:] = np.clip(combined[1:], -18.0, 18.0)
-
-    result = np.zeros(3, dtype=np.float64)
-    result[0] = (
-        combined[0]
-        * _smooth_skin_lightness_gate(lab, model)
-    )
-    result[1:] = (
-        combined[1:]
-        * _smooth_skin_gate(lab, model)
-    )
-    return result
 
 
-def _apply_smooth_skin_rgb(
-    rgb: Sequence[float],
-    model: Dict[str, Any],
-    strength: float,
-) -> List[float]:
-    src_lab = _lab_array_from_rgb(
-        np.asarray(rgb, dtype=np.float64).reshape(1, 3)
-    )[0]
-    corrected_lab = (
-        src_lab
-        + float(strength) * _smooth_skin_delta_lab(src_lab, model)
-    )
-    return [
-        float(v) for v in _rgb_array_from_lab(
-            corrected_lab.reshape(1, 3)
-        )[0]
-    ]
 
 
-def _rows_after_smooth_skin(
-    rows: List[Dict[str, Any]],
-    model: Dict[str, Any],
-    strength: float,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        t = row["target"]
-        corrected = _apply_smooth_skin_rgb(
-            [float(t["r"]), float(t["g"]), float(t["b"])],
-            model,
-            strength,
-        )
-        new_t = dict(t)
-        new_t["r"], new_t["g"], new_t["b"] = corrected
-        new_t["y"] = (
-            0.2126 * corrected[0]
-            + 0.7152 * corrected[1]
-            + 0.0722 * corrected[2]
-        )
-        new_row = dict(row)
-        new_row["target"] = new_t
-        out.append(new_row)
-    return out
 
 
-def _stratified_skin_folds(
-    rows: List[Dict[str, Any]],
-    fold_count: int = 3,
-) -> List[List[int]]:
-    """Hold out complete facial zones to prevent correlated-pixel leakage.
-
-    Anchors from one zone are neighbouring statistics of the same underlying
-    pixels even when their quantile windows no longer overlap. Keeping an
-    entire zone in one fold tests whether the colour model generalizes to an
-    independently measured part of the face instead of merely interpolating
-    between adjacent anchors.
-    """
-    zones = sorted(set(str(row.get("zone") or "") for row in rows))
-    zone_index = {name: i for i, name in enumerate(zones)}
-
-    folds: List[List[int]] = [
-        [] for _ in range(max(2, int(fold_count)))
-    ]
-    for index, row in enumerate(rows):
-        z = zone_index.get(str(row.get("zone") or ""), 0)
-        folds[z % len(folds)].append(index)
-    return folds
 
 
-def _skin_cross_validation_scores(
-    rows: List[Dict[str, Any]],
-    strengths: Sequence[float],
-    orthogonalize_lightness: bool = False,
-) -> Dict[float, float]:
-    totals = {float(s): [0.0, 0.0] for s in strengths}
-    folds = _stratified_skin_folds(rows, 3)
-    valid_folds = 0
 
-    for held_indices in folds:
-        held_set = set(held_indices)
-        train = [
-            row for i, row in enumerate(rows) if i not in held_set
-        ]
-        held = [
-            row for i, row in enumerate(rows) if i in held_set
-        ]
-        if len(train) < 6 or len(held) < 2:
-            continue
 
-        model = _fit_smooth_skin_model(
-            train,
-            orthogonalize_lightness=orthogonalize_lightness,
-        )
-        if model is None:
-            continue
-        valid_folds += 1
-
-        for strength in strengths:
-            after = (
-                held
-                if abs(float(strength)) <= 1e-12
-                else _rows_after_smooth_skin(
-                    held, model, float(strength)
-                )
-            )
-            err, weights = _row_delta_e_arrays(after)
-            totals[float(strength)][0] += float(
-                np.sum(err * weights)
-            )
-            totals[float(strength)][1] += float(np.sum(weights))
-
-    if valid_folds < 2:
-        model = _fit_smooth_skin_model(
-            rows,
-            orthogonalize_lightness=orthogonalize_lightness,
-        )
-        if model is None:
-            baseline = _rows_delta_e_identity(rows)
-            return {float(s): baseline for s in strengths}
-        return {
-            float(s): (
-                _rows_delta_e_identity(rows)
-                if abs(float(s)) <= 1e-12
-                else _rows_delta_e_identity(
-                    _rows_after_smooth_skin(rows, model, float(s))
-                )
-            )
-            for s in strengths
-        }
-
-    baseline = _rows_delta_e_identity(rows)
-    return {
-        strength: (
-            total / weight if weight > 0.0 else baseline
-        )
-        for strength, (total, weight) in totals.items()
-    }
 
 
 def _sample_collateral_pixels(
@@ -3440,249 +3147,6 @@ def _strength_grid(
     )
 
 
-def _choose_smooth_skin_strength(
-    rows: List[Dict[str, Any]],
-    lut: Dict[str, Any],
-    minimum_gain: float,
-    collateral_pixels: Optional[np.ndarray] = None,
-    collateral_before_lab: Optional[np.ndarray] = None,
-    protection_bias: float = 0.0,
-    orthogonalize_lightness: bool = False,
-) -> Tuple[float, Dict[str, float]]:
-    """Choose strength using the actual exported LUT, not the continuous model."""
-    baseline = float(_rows_delta_e_identity(rows))
-    baseline_chroma = _chroma_stage_stats(rows, rows)
-    protection = _protection_profile(
-        protection_bias,
-        minimum_gain,
-    )
-    accuracy_mix = float(protection["accuracy_mix"])
-    max_strength = float(np.clip(
-        protection["max_skin_strength"],
-        0.60,
-        1.50,
-    ))
-    strengths = _strength_grid(max_strength, 0.05)
-
-    # CV still tests generalization of the continuous fit.
-    cv_scores = _skin_cross_validation_scores(
-        rows,
-        (0.0,) + strengths,
-        orthogonalize_lightness=orthogonalize_lightness,
-    )
-    cv_baseline = float(cv_scores.get(0.0, baseline))
-
-    collateral_pixels = (
-        np.empty((0, 3), dtype=np.float64)
-        if collateral_pixels is None
-        else np.asarray(collateral_pixels, dtype=np.float64).reshape(-1, 3)
-    )
-
-    candidates: List[Dict[str, Any]] = []
-    for strength in strengths:
-        actual_rows = _rows_after_lut(rows, lut, float(strength))
-        stats = _stage_stats(rows, actual_rows)
-        chroma_stats = _chroma_stage_stats(
-            rows,
-            actual_rows,
-        )
-        cv_after = float(cv_scores[float(strength)])
-        cv_gain = cv_baseline - cv_after
-        collateral = _lut_collateral_stats(
-            collateral_pixels,
-            lut,
-            float(strength),
-            before_lab=collateral_before_lab,
-        )
-        catastrophic = _collateral_is_catastrophic(
-            collateral,
-            fine_tune=False,
-            protection_bias=protection_bias,
-        )
-        geometry = _lut_geometry_stats(lut, float(strength))
-        geometry_safe = _lut_geometry_is_safe(
-            geometry,
-            protection_bias,
-        )
-
-        valid = bool(
-            stats["gain"] + 1e-9 >= max(0.0, float(minimum_gain))
-            and stats["nonworse_fraction"] >= protection["skin_nonworse"]
-            and stats["p75_worsening"] <= protection["skin_p75"]
-            and cv_gain + 1e-9 >= protection["skin_cv_min"]
-            and not catastrophic
-            and geometry_safe
-        )
-        score = float(
-            stats["after"]
-            + 0.12 * chroma_stats["after"]
-            + protection["score_cv_weight"]
-                * max(0.0, cv_after - stats["after"])
-            + protection["score_collateral_weight"]
-                * _collateral_penalty(
-                    collateral,
-                    fine_tune=False,
-                )
-            + (1.0 - 0.85 * accuracy_mix)
-                * _lut_geometry_penalty(geometry)
-        )
-        candidates.append({
-            "strength": float(strength),
-            "rows": actual_rows,
-            "stats": stats,
-            "chroma": chroma_stats,
-            "cv_after": cv_after,
-            "cv_gain": cv_gain,
-            "collateral": collateral,
-            "geometry": geometry,
-            "valid": valid,
-            "score": score,
-        })
-
-    valid_candidates = [item for item in candidates if item["valid"]]
-    if not valid_candidates:
-        best_actual = min(
-            [float(item["stats"]["after"]) for item in candidates],
-            default=baseline,
-        )
-        best_cv = min(
-            [float(cv_scores[s]) for s in strengths],
-            default=cv_baseline,
-        )
-        return 0.0, {
-            "baseline": baseline,
-            "cv_baseline": cv_baseline,
-            "cv_after": best_cv,
-            "cv_gain": cv_baseline - best_cv,
-            "full_after": best_actual,
-            "full_gain": max(0.0, baseline - best_actual),
-            "chroma_before": float(
-                baseline_chroma["before"]
-            ),
-            "chroma_after": float(
-                baseline_chroma["before"]
-            ),
-            "chroma_gain": 0.0,
-            "nonworse_fraction": 1.0,
-            "collateral_count": 0.0,
-            "collateral_affected_fraction": 0.0,
-            "collateral_mean": 0.0,
-            "collateral_p95": 0.0,
-            "collateral_p99": 0.0,
-            "geometry_folded_cells": 0.0,
-            "geometry_min_determinant": 1.0,
-            "geometry_p01_min_singular": 1.0,
-            "geometry_p99_max_singular": 1.0,
-            "geometry_p99_curvature": 0.0,
-            "geometry_new_clipping_fraction": 0.0,
-        }
-
-    best = min(valid_candidates, key=lambda item: item["score"])
-    score_span = max(
-        float(item["score"])
-        for item in valid_candidates
-    ) - float(best["score"])
-    near_best_score_extra = (
-        (1.0 - accuracy_mix)
-        * float(protection["near_best_score_extra"])
-        + accuracy_mix * (score_span + 1e-9)
-    )
-    best_gain = max(
-        float(item["stats"]["gain"])
-        for item in valid_candidates
-    )
-    best_chroma_gain = max(
-        float(item["chroma"]["gain"])
-        for item in valid_candidates
-    )
-    chroma_is_material = (
-        float(baseline_chroma["before"]) >= 1.0
-        and best_chroma_gain > 0.15
-    )
-    near_best = [
-        item for item in valid_candidates
-        if (
-            float(item["stats"]["gain"])
-            >= best_gain * protection["near_best_gain_ratio"]
-            and (
-                not chroma_is_material
-                or float(item["chroma"]["gain"])
-                    >= best_chroma_gain
-                    * protection["near_best_chroma_ratio"]
-            )
-            and float(item["score"])
-            <= float(best["score"])
-            + near_best_score_extra
-        )
-    ]
-
-    if protection["bias"] < -1e-9:
-        # Accuracy: the eligible set widens continuously as the slider moves
-        # left. At -100 it contains every otherwise-valid candidate, reproducing
-        # the maximum-Accuracy selection rule.
-        chosen = min(
-            near_best or valid_candidates,
-            key=lambda item: (
-                float(item["stats"]["after"]),
-                float(item["chroma"]["after"]),
-                -float(item["strength"]),
-            ),
-        )
-    else:
-        # Auto preserves the old weakest-near-best policy. Safety makes the
-        # eligible set wider and also lowers max_strength above, so it visibly
-        # backs off when there is a meaningful safety/accuracy tradeoff.
-        chosen = min(
-            near_best or [best],
-            key=lambda item: item["strength"],
-        )
-
-    stats = chosen["stats"]
-    collateral = chosen["collateral"]
-    geometry = chosen["geometry"]
-    return float(chosen["strength"]), {
-        "baseline": baseline,
-        "cv_baseline": cv_baseline,
-        "cv_after": float(chosen["cv_after"]),
-        "cv_gain": float(chosen["cv_gain"]),
-        "full_after": float(stats["after"]),
-        "full_gain": float(stats["gain"]),
-        "chroma_before": float(
-            baseline_chroma["before"]
-        ),
-        "chroma_after": float(
-            chosen["chroma"]["after"]
-        ),
-        "chroma_gain": float(
-            chosen["chroma"]["gain"]
-        ),
-        "nonworse_fraction": float(stats["nonworse_fraction"]),
-        "collateral_count": float(collateral.get("count", 0.0)),
-        "collateral_affected_fraction": float(
-            collateral.get("affected_fraction", 0.0)
-        ),
-        "collateral_mean": float(collateral.get("mean", 0.0)),
-        "collateral_p95": float(collateral.get("p95", 0.0)),
-        "collateral_p99": float(collateral.get("p99", 0.0)),
-        "geometry_folded_cells": float(
-            geometry.get("folded_cells", 0.0)
-        ),
-        "geometry_min_determinant": float(
-            geometry.get("min_determinant", 1.0)
-        ),
-        "geometry_p01_min_singular": float(
-            geometry.get("p01_min_singular", 1.0)
-        ),
-        "geometry_p99_max_singular": float(
-            geometry.get("p99_max_singular", 1.0)
-        ),
-        "geometry_p99_curvature": float(
-            geometry.get("p99_curvature", 0.0)
-        ),
-        "geometry_new_clipping_fraction": float(
-            geometry.get("new_clipping_fraction", 0.0)
-        ),
-    }
 
 
 
@@ -4602,96 +4066,6 @@ def _rows_after_lut(
     return out
 
 
-def _refinement_cross_validation_scores(
-    rows: List[Dict[str, Any]],
-    primary_strength: float,
-    strengths: Sequence[float],
-    orthogonalize_lightness: bool = False,
-    accuracy_mix: float = 0.0,
-) -> Dict[float, float]:
-    """Validate the residual LUT on facial zones it did not fit.
-
-    The previous refinement was trained and selected on the same anchors. This
-    zone-held-out check preserves its useful Accuracy gain without accepting a
-    local residual that only memorizes one cheek or forehead measurement.
-    """
-    requested = tuple(float(value) for value in strengths)
-    totals = {value: [0.0, 0.0] for value in requested}
-    valid_folds = 0
-
-    for held_indices in _stratified_skin_folds(rows, 3):
-        held_set = set(held_indices)
-        train = [
-            row for index, row in enumerate(rows)
-            if index not in held_set
-        ]
-        held = [
-            row for index, row in enumerate(rows)
-            if index in held_set
-        ]
-        if len(train) < 6 or len(held) < 2:
-            continue
-        model = _fit_smooth_skin_model(
-            train,
-            orthogonalize_lightness=orthogonalize_lightness,
-        )
-        if model is None:
-            continue
-        base = _build_smooth_skin_lut(model, 1.0, 33)
-        primary = _compose_skin_and_refinement_lut(
-            base,
-            primary_strength,
-        )
-        train_primary = _rows_after_lut(train, primary, 1.0)
-        refinement = _build_residual_refinement_lut(
-            train_primary,
-            17,
-            accuracy_mix,
-        )
-        if refinement is None:
-            continue
-
-        primary_outputs = np.asarray(
-            primary["outputs"], dtype=np.float64
-        )
-        refined_full = _apply_lut_array(
-            primary_outputs,
-            refinement,
-            1.0,
-        )
-        valid_folds += 1
-
-        for strength in requested:
-            if abs(strength) <= 1e-12:
-                candidate = primary
-            else:
-                candidate = {
-                    "size": int(primary["size"]),
-                    "nodes": np.asarray(
-                        primary["nodes"], dtype=np.float64
-                    ),
-                    "outputs": np.clip(
-                        primary_outputs
-                        + strength * (refined_full - primary_outputs),
-                        0.0,
-                        255.0,
-                    ),
-                }
-            evaluated = _rows_after_lut(held, candidate, 1.0)
-            errors, weights = _row_delta_e_arrays(evaluated)
-            totals[strength][0] += float(np.sum(errors * weights))
-            totals[strength][1] += float(np.sum(weights))
-
-    if valid_folds < 2:
-        baseline = _rows_delta_e_identity(rows)
-        return {value: baseline for value in requested}
-    return {
-        value: (
-            total / weight
-            if weight > 0.0 else _rows_delta_e_identity(rows)
-        )
-        for value, (total, weight) in totals.items()
-    }
 
 
 def _lut_collateral_stats(
@@ -5185,28 +4559,6 @@ def _worst_zone_delta_e(rows: List[Dict[str, Any]]) -> Tuple[str, float]:
     return max(values, key=lambda item: item[1])
 
 
-def _rows_with_rgb_values(
-    rows: List[Dict[str, Any]],
-    rgb_values: np.ndarray,
-) -> List[Dict[str, Any]]:
-    values = np.asarray(rgb_values, dtype=np.float64).reshape(-1, 3)
-    if len(rows) != values.shape[0]:
-        raise ValueError("Row/RGB count mismatch")
-    out: List[Dict[str, Any]] = []
-    for row, rgb in zip(rows, values):
-        new_target = dict(row["target"])
-        new_target["r"], new_target["g"], new_target["b"] = [
-            float(value) for value in rgb
-        ]
-        new_target["y"] = (
-            0.2126 * float(rgb[0])
-            + 0.7152 * float(rgb[1])
-            + 0.0722 * float(rgb[2])
-        )
-        new_row = dict(row)
-        new_row["target"] = new_target
-        out.append(new_row)
-    return out
 
 
 def _rows_after_pipeline(
@@ -5505,6 +4857,7 @@ def _joint_regularization(
 def _joint_parameter_specs(
     params: JointMatchParams,
     protection_bias: float,
+    lightness_balance: float = 0.0,
 ) -> List[Tuple[str, Optional[int], float, float, float]]:
     """Return Accuracy-scaled coordinate-descent ranges.
 
@@ -5533,9 +4886,31 @@ def _joint_parameter_specs(
 
     add("wb_log_r", None, 0.020, -wb_cap, wb_cap)
     add("wb_log_b", None, 0.020, -wb_cap, wb_cap)
-    add("tone_shadow", None, 0.80, -TONE_SHADOW_HARD_LIMIT, TONE_SHADOW_HARD_LIMIT)
-    add("tone_mid", None, 1.20, -TONE_MID_LIMIT, TONE_MID_LIMIT)
-    add("tone_high", None, 2.00, -TONE_HIGH_HARD_LIMIT, TONE_HIGH_HARD_LIMIT)
+
+    # Shadows/Highlights is an explicit user preference and must not disappear
+    # when Accuracy later revisits Tone.  Near Auto the joint optimizer retains
+    # its normal Tone freedom; toward either slider endpoint that freedom is
+    # reduced smoothly around the already bias-aware Tone solution.  At +/-100
+    # Tone is held fixed while Accuracy may still optimize WB and Skin Match.
+    tone_bias = abs(_normalized_percent_bias(lightness_balance))
+    tone_lock = tone_bias * tone_bias * (3.0 - 2.0 * tone_bias)
+    tone_freedom = 1.0 - tone_lock
+
+    def add_tone(
+        name: str,
+        base_step: float,
+        hard_lower: float,
+        hard_upper: float,
+    ) -> None:
+        current = _get_joint_parameter(params, name, None)
+        lower = float(current + t * tone_freedom * (float(hard_lower) - current))
+        upper = float(current + t * tone_freedom * (float(hard_upper) - current))
+        step = float(base_step) * t * tone_freedom
+        specs.append((name, None, step, lower, upper))
+
+    add_tone("tone_shadow", 0.80, -TONE_SHADOW_HARD_LIMIT, TONE_SHADOW_HARD_LIMIT)
+    add_tone("tone_mid", 1.20, -TONE_MID_LIMIT, TONE_MID_LIMIT)
+    add_tone("tone_high", 2.00, -TONE_HIGH_HARD_LIMIT, TONE_HIGH_HARD_LIMIT)
     for i in range(len(params.l_knots)):
         add("l_knots", i, 0.60, -5.0, 5.0)
     for i in range(len(params.logc_knots)):
@@ -5577,6 +4952,7 @@ def _optimize_joint_accuracy(
     template_model: Dict[str, Any],
     knot_positions: np.ndarray,
     protection_bias: float,
+    lightness_balance: float = 0.0,
 ) -> Tuple[JointMatchParams, Dict[str, Any]]:
     """Deterministic low-dimensional coordinate descent for Accuracy mode."""
     accuracy_mix = _accuracy_profile_mix(protection_bias)
@@ -5633,7 +5009,11 @@ def _optimize_joint_accuracy(
 
     best = dict(initial)
     best["loss"] = float(best["fit_de"] + best["regularization"])
-    specs = _joint_parameter_specs(params, protection_bias)
+    specs = _joint_parameter_specs(
+        params,
+        protection_bias,
+        lightness_balance,
+    )
     scales_all = (1.0, 0.5, 0.25, 0.125)
     # Keep the optimizer topology identical at every non-zero Accuracy value.
     # v0.15.2 already scaled the reachable parameter interval and coordinate
@@ -5783,6 +5163,7 @@ def _compile_joint_candidate(
         if float(fit_stats["gain"]) + 1e-9 < max(0.0, float(minimum_gain)):
             continue
         return {
+            "params": _copy_joint_params(candidate_params),
             "wb_curves": None if _curve_set_is_identity(wb_curves) else wb_curves,
             "tone_curve": None if _curve_is_identity(tone_curve) else tone_curve,
             "tone_curves": None if _curve_is_identity(tone_curve) else tone_curves,
@@ -5814,6 +5195,7 @@ def _compile_joint_candidate(
         zero_params.hue_knots *= 0.0
         zero_params.residual_strength = 0.0
         return {
+            "params": _copy_joint_params(params),
             "wb_curves": None if _curve_set_is_identity(wb_curves) else wb_curves,
             "tone_curve": None if _curve_is_identity(tone_curve) else tone_curve,
             "tone_curves": None if _curve_is_identity(tone_curve) else tone_curves,
@@ -6182,6 +5564,7 @@ def fit_smooth_match(
             skin_model,
             knot_positions,
             -100.0,
+            lightness_balance,
         )
         joint_diag = dict(endpoint_diag)
         joint_diag["endpoint_accuracy"] = -100.0
@@ -6237,11 +5620,53 @@ def fit_smooth_match(
                         if wb_curves else fit_rows
                     ))
                     after_tone = float(_rows_delta_e_identity(tone_fit_rows))
-                    tone_stats = _stage_stats(
+                    wb_actual_fit_rows = (
                         _rows_after_curve_set(fit_rows, wb_curves)
-                        if wb_curves else fit_rows,
+                        if wb_curves else [dict(row) for row in fit_rows]
+                    )
+                    wb_actual_validation_rows = (
+                        _rows_after_curve_set(validation_rows, wb_curves)
+                        if wb_curves else [dict(row) for row in validation_rows]
+                    )
+                    wb_validation_stats = _stage_stats(
+                        validation_rows,
+                        wb_actual_validation_rows,
+                    )
+                    tone_stats = _stage_stats(
+                        wb_actual_fit_rows,
                         tone_fit_rows,
                     )
+                    if tone_curves:
+                        tone_light = _lightness_stage_stats(
+                            wb_actual_fit_rows,
+                            tone_fit_rows,
+                            lightness_balance,
+                        )
+                        actual_joint_params = compiled.get("params")
+                        tone_diag = {
+                            "used": True,
+                            "lightness_before": float(tone_light["before"]),
+                            "lightness_after": float(tone_light["after"]),
+                            "lightness_gain": float(tone_light["gain"]),
+                            "strength": 1.0,
+                            "shadow_offset": float(actual_joint_params.tone_shadow)
+                                if actual_joint_params is not None else 0.0,
+                            "mid_offset": float(actual_joint_params.tone_mid)
+                                if actual_joint_params is not None else 0.0,
+                            "high_offset": float(actual_joint_params.tone_high)
+                                if actual_joint_params is not None else 0.0,
+                        }
+                    else:
+                        tone_diag = {
+                            "used": False,
+                            "lightness_before": 0.0,
+                            "lightness_after": 0.0,
+                            "lightness_gain": 0.0,
+                            "strength": 0.0,
+                            "shadow_offset": 0.0,
+                            "mid_offset": 0.0,
+                            "high_offset": 0.0,
+                        }
                     skin_diag.update({
                         "baseline": after_tone,
                         "full_after": compiled_fit_de,
@@ -6659,23 +6084,6 @@ def _delta_e_2000_array(
     )
 
 
-def _rows_delta_e_vectorized(rows: List[Dict[str, Any]]) -> float:
-    if not rows:
-        return 0.0
-    target_rgb = np.asarray([
-        [float(row["target"][k]) for k in ("r", "g", "b")]
-        for row in rows
-    ], dtype=np.float64)
-    reference_lab = np.asarray([
-        _reference_lab_from_anchor(row["reference"])
-        for row in rows
-    ], dtype=np.float64)
-    weights = np.asarray([
-        max(1e-4, float(row.get("weight", 1.0)))
-        for row in rows
-    ], dtype=np.float64)
-    errors = _delta_e_2000_array(_lab_array_from_rgb(target_rgb), reference_lab)
-    return float(np.sum(errors * weights) / max(1e-9, float(np.sum(weights))))
 
 
 def safe_preset_filename(name: str, preset_id: str) -> str:
