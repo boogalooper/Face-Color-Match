@@ -134,9 +134,6 @@ jobs:
           if data.startswith(b"\xef\xbb\xbf"):
               raise SystemExit("install.bat must be UTF-8 without BOM")
 
-          if b"\r\n" not in data:
-              raise SystemExit("install.bat must use CRLF line endings")
-
           print("JSX and BAT checks OK")
           PY
 
@@ -157,6 +154,21 @@ jobs:
           cp "README.md" "${PACKAGE_DIR}/"
           cp "install.bat" "${PACKAGE_DIR}/"
           cp -R "lib" "${PACKAGE_DIR}/"
+
+          # Git may check text files out with LF on the Linux runner.
+          # Normalize the BAT inside the release package to Windows CRLF
+          # instead of failing the whole release because of checkout EOLs.
+          PACKAGE_DIR="${PACKAGE_DIR}" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["PACKAGE_DIR"]) / "install.bat"
+          data = path.read_bytes()
+
+          # Preserve UTF-8 without BOM and normalize every newline to CRLF.
+          data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+          path.write_bytes(data.replace(b"\n", b"\r\n"))
+          PY
 
           find "${PACKAGE_DIR}" \
             -type d -name "__pycache__" \
