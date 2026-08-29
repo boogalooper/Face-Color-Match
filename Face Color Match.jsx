@@ -10,7 +10,6 @@
             /selectedPresetId [(preset id) /string]
             /mode [(matching mode) /string]
             /minimumGain [(minimum Delta E gain) /double]
-            /useMaster [(use master curve) /boolean]
             /strength [(strength) /integer]
             /layerName [(layer name) /string]
             /skipNoFace [(skip if no face) /boolean]
@@ -25,7 +24,7 @@ app.bringToFront();
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.6.0",
+            version: "0.7.5",
             uuid: "db558f66-6e38-41e7-a274-70537f4632af",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
@@ -35,7 +34,8 @@ app.bringToFront();
             settingsFolder: "Boogalooper/Face Color Match",
             settingsFile: "settings.json",
             startupFile: "face-color-match-startup.json",
-            launchFile: "face-color-match-launch.json"
+            launchFile: "face-color-match-launch.json",
+            logFile: "face-color-match.log"
         },
         c2t = charIDToTypeID,
         s2t = stringIDToTypeID,
@@ -311,7 +311,6 @@ app.bringToFront();
             previewRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             previewLabel = previewRow.add("statictext", undefined, str.previewSize),
             previewEdit = previewRow.add("edittext", undefined, String(temp.previewSize)),
-            master = pGeneral.add("checkbox", undefined, str.useMaster),
             skip = pGeneral.add("checkbox", undefined, str.skipNoFace),
             layerRow = pGeneral.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             layerLabel = layerRow.add("statictext", undefined, str.layerName),
@@ -332,7 +331,6 @@ app.bringToFront();
         ui.setFixedWidth(layerEdit, 220);
         ui.setFixedWidth(info, 455);
 
-        master.value = !!temp.useMaster;
         skip.value = !!temp.skipNoFace;
 
         folderButton.onClick = function () {
@@ -353,7 +351,6 @@ app.bringToFront();
 
             temp.presetFolder = normalizeFolderPath(folder);
             temp.previewSize = preview;
-            temp.useMaster = !!master.value;
             temp.skipNoFace = !!skip.value;
             temp.layerName = layer || "Face Color Match";
             cfg.data = temp;
@@ -444,10 +441,10 @@ app.bringToFront();
             lut && lut.delta_e_before !== undefined &&
             lut.delta_e_after !== undefined
         ) {
-            return "Residual LUT ΔE " + oneDecimal(lut.delta_e_before) + "→" +
+            return "Fine Tune ΔE " + oneDecimal(lut.delta_e_before) + "→" +
                 oneDecimal(lut.delta_e_after);
         }
-        return "Residual LUT";
+        return "Fine Tune";
     }
 
     function withPreview(callback) {
@@ -495,6 +492,23 @@ app.bringToFront();
         }
     }
 
+
+    function removeLutTempFiles(lut) {
+        if (!lut) return;
+        var paths = [
+                String(lut.path || ""),
+                String(lut.profile_path || "")
+            ],
+            i, file;
+
+        for (i = 0; i < paths.length; i++) {
+            if (!paths[i]) continue;
+            try {
+                file = new File(paths[i]);
+                if (file.exists) file.remove();
+            } catch (_) { }
+        }
+    }
 
     function applyParametricResult(result, groupName, opacity) {
         var doc = app.activeDocument,
@@ -562,6 +576,12 @@ app.bringToFront();
         } catch (e) {
             try { group.remove(); } catch (_) { }
             throw e;
+        } finally {
+            // Python-created LUT payloads are only transport files. Photoshop
+            // embeds both CUBE data and the device-link ICC into the adjustment
+            // layer, so they are never needed after this apply attempt.
+            removeLutTempFiles(skinLut);
+            removeLutTempFiles(residualLut);
         }
     }
 
@@ -705,20 +725,23 @@ app.bringToFront();
             }
 
             // Both payloads are embedded into the Color Lookup descriptor.
-            // Once Photoshop accepts the layer, the temporary files are no longer
-            // needed and can be removed immediately.
-            try { if (cubeFile.exists) cubeFile.remove(); } catch (_) { }
-            try { if (profileFile.exists) profileFile.remove(); } catch (_) { }
+            // Disk files are cleaned in finally below.
             return {
                 imported: true,
                 method: "embedded device-link ICC"
             };
         } catch (e) {
-            if (cubeOpened) try { cubeFile.close(); } catch (_) { }
-            if (profileOpened) try { profileFile.close(); } catch (_) { }
             if (layer) try { layer.remove(); } catch (_) { }
             throw e;
         } finally {
+            if (cubeOpened) try { cubeFile.close(); } catch (_) { }
+            if (profileOpened) try { profileFile.close(); } catch (_) { }
+
+            // The CUBE and ICC are transport payloads only. Delete them whether
+            // the import succeeded or failed; a failed layer is removed above.
+            try { if (cubeFile.exists) cubeFile.remove(); } catch (_) { }
+            try { if (profileFile.exists) profileFile.remove(); } catch (_) { }
+
             if (storedChannel) {
                 try { doc.selection.load(storedChannel, SelectionType.REPLACE); } catch (_) { }
                 try { storedChannel.remove(); } catch (_) { }
@@ -756,6 +779,7 @@ app.bringToFront();
                     while ((new Date()).getTime() < stopDeadline && checkConnection(APP.apiHost, APP.apiPortSend)) $.sleep(80);
                 } else {
                     validatePing(runningInfo);
+                    clearBridgeTempFiles();
                     return;
                 }
             }
@@ -768,6 +792,7 @@ app.bringToFront();
             while ((new Date()).getTime() < deadline) {
                 if (checkConnection(APP.apiHost, APP.apiPortSend)) {
                     validatePing(self.ping());
+                    clearBridgeTempFiles();
                     return;
                 }
                 last = readStartupStatus();
@@ -799,7 +824,7 @@ app.bringToFront();
                 preset_id: data.selectedPresetId,
                 mode: data.mode,
                 minimum_gain: Number(data.minimumGain),
-                use_master: !!data.useMaster
+                use_master: true
             }, 45000);
         };
         function call(type, message, timeout) {
@@ -846,6 +871,22 @@ app.bringToFront();
             var f = new File(Folder.temp.fsName + "/" + APP.startupFile);
             if (f.exists) try { f.remove(); } catch (_) { }
         }
+        function clearBridgeTempFiles() {
+            var names = [
+                    APP.startupFile,
+                    APP.launchFile,
+                    APP.logFile,
+                    APP.startupFile + ".tmp",
+                    APP.launchFile + ".tmp"
+                ],
+                i, f;
+            for (i = 0; i < names.length; i++) {
+                try {
+                    f = new File(Folder.temp.fsName + "/" + names[i]);
+                    if (f.exists) f.remove();
+                } catch (_) { }
+            }
+        }
         function readStartupStatus() {
             var f = new File(Folder.temp.fsName + "/" + APP.startupFile);
             if (!f.exists) return null;
@@ -891,7 +932,6 @@ app.bringToFront();
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
                 mode: String(cfg.data.mode || "parametric"),
                 minimumGain: gain,
-                useMaster: !!cfg.data.useMaster,
                 strength: Math.round(strength),
                 layerName: String(cfg.data.layerName || "Face Color Match"),
                 skipNoFace: !!cfg.data.skipNoFace
@@ -943,8 +983,6 @@ app.bringToFront();
                 cfg.data.mode = String(values.mode || "parametric");
             if (values.minimumGain !== undefined)
                 cfg.data.minimumGain = Number(values.minimumGain);
-            if (values.useMaster !== undefined)
-                cfg.data.useMaster = !!values.useMaster;
             if (values.strength !== undefined)
                 cfg.data.strength = Number(values.strength);
             if (values.layerName !== undefined)
@@ -1170,7 +1208,6 @@ app.bringToFront();
                 settingsVersion: 5,
                 mode: "parametric",
                 minimumGain: 0.1,
-                useMaster: true,
                 strength: 100,
                 layerName: "Face Color Match",
                 skipNoFace: false
@@ -1198,8 +1235,6 @@ app.bringToFront();
                 0,
                 Math.min(2, Math.round(gain * 10) / 10)
             );
-
-            d.useMaster = !!d.useMaster;
 
             if (isNaN(strengthValue)) strengthValue = 100;
             d.strength = Math.max(
@@ -1232,7 +1267,7 @@ app.bringToFront();
             progressMeasureReference: "Измерение образца...", progressPreparePreview: "Подготовка изображения...", progressMatch: "Выравнивание цвета...",
             progressAnalyzeFace: "Анализ лица и построение плавной коррекции...", progressCreateCurves: "Создание корректирующих слоёв и LUT...",
             presetFolder: "Папка пресетов", previewSize: "Размер анализа, px",
-            minimumGain: "Мин. улучшение ΔE", useMaster: "Корректировать тон по светлоте",
+            minimumGain: "Мин. улучшение ΔE",
             skipNoFace: "Пропускать изображение, если лицо не найдено", layerName: "Имя слоя", general: "Общие настройки",
             serverInfo: "Python-сервер запускается автоматически и выключается через 30 минут бездействия. Версия Python выбирается автоматически из установленных поддерживаемых вариантов.", selectPresetFolder: "Выберите папку пресетов",
             folderRequired: "Укажите папку пресетов.", noPresetSelected: "Не выбран пресет образца.", invalidCurveResult: "Python вернул некорректный результат кривых.",
@@ -1248,7 +1283,7 @@ app.bringToFront();
             progressMeasureReference: "Measuring reference...", progressPreparePreview: "Preparing image...", progressMatch: "Matching color...",
             progressAnalyzeFace: "Analyzing face and fitting smooth match...", progressCreateCurves: "Creating adjustment layers and LUTs...",
             presetFolder: "Preset folder", previewSize: "Analysis size, px",
-            minimumGain: "Min. ΔE improvement", useMaster: "Correct tone from lightness",
+            minimumGain: "Min. ΔE improvement",
             skipNoFace: "Skip image when no face is found", layerName: "Layer name", general: "General settings",
             serverInfo: "The Python server starts automatically and exits after 30 minutes of inactivity. A supported installed Python is selected automatically.", selectPresetFolder: "Select preset folder",
             folderRequired: "Select a preset folder.", noPresetSelected: "No reference preset is selected.", invalidCurveResult: "Python returned an invalid curve result.",

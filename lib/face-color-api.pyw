@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.6.0"
+VERSION = "0.7.5"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -49,6 +49,49 @@ TEMP_DIR = Path(tempfile.gettempdir())
 STARTUP_STATUS_FILE = TEMP_DIR / "face-color-match-startup.json"
 LAUNCH_CONFIG_FILE = TEMP_DIR / "face-color-match-launch.json"
 LOG_FILE = TEMP_DIR / "face-color-match.log"
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def cleanup_stale_temp_payloads() -> None:
+    """Remove payloads left by an interrupted older run.
+
+    Called only after the final Python interpreter is selected and dependencies
+    are imported, so it cannot interfere with bootstrap hand-off.
+    """
+    patterns = (
+        "face-color-match-*.jpg",
+        "face-color-match-residual-*.cube",
+        "face-color-match-residual-*.icc",
+        "face-color-match-startup.json.tmp",
+        "face-color-match-launch.json.tmp",
+    )
+    for pattern in patterns:
+        try:
+            for path in TEMP_DIR.glob(pattern):
+                _safe_unlink(path)
+        except OSError:
+            pass
+
+
+def cleanup_clean_shutdown_files() -> None:
+    """Remove bridge bookkeeping/log files after a normal server shutdown."""
+    for path in (
+        STARTUP_STATUS_FILE,
+        LAUNCH_CONFIG_FILE,
+        LOG_FILE,
+        STARTUP_STATUS_FILE.with_suffix(STARTUP_STATUS_FILE.suffix + ".tmp"),
+        LAUNCH_CONFIG_FILE.with_suffix(LAUNCH_CONFIG_FILE.suffix + ".tmp"),
+    ):
+        _safe_unlink(path)
+
 
 _LAST_ACTIVITY = time.monotonic()
 _ACTIVITY_LOCK = threading.Lock()
@@ -1227,6 +1270,7 @@ def _tone_lightness_loss(
         + 0.008 * high * high
         + 2.6 * shape["max_bend"]
         + 0.10 * abs(shape["shadow_offset_48"])
+        + 0.34 * max(0.0, shape["shadow_offset_48"])
     )
 
     if shape["min_slope"] < 0.78:
@@ -1327,7 +1371,8 @@ def _optimize_lightness_tone(
             and shape["min_slope"] >= 0.76
             and shape["max_slope"] <= 1.26
             and shape["max_bend"] <= 0.24
-            and abs(shape["shadow_offset_48"]) <= 3.0
+            and shape["shadow_offset_48"] >= -3.0
+            and shape["shadow_offset_48"] <= 1.35
         )
 
         candidates.append({
@@ -1435,6 +1480,7 @@ def _smooth_weighted_series(
 
 
 def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Smooth full-Lab base + weak local RBF residual."""
     if len(rows) < 6:
         return None
 
@@ -1453,43 +1499,58 @@ def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     src_lab = _lab_array_from_rgb(src_rgb)
     ref_lab = _lab_array_from_rgb(ref_rgb)
 
-    residual_ab = np.clip(ref_lab[:, 1:3] - src_lab[:, 1:3], -10.0, 10.0)
+    desired = ref_lab - src_lab
+    desired[:, 0] = np.clip(desired[:, 0], -3.5, 3.5)
+    desired[:, 1:] = np.clip(desired[:, 1:], -12.0, 12.0)
 
-    # Aggregate measurements by tonal quantile. The result is a smooth
-    # lightness-dependent chroma function rather than independent zone edits.
-    group_rows = []
+    grouped = []
     for q in sorted(set(round(float(row.get("q", 0.0)), 2) for row in rows)):
-        idx = np.asarray(
-            [i for i, row in enumerate(rows) if round(float(row.get("q", 0.0)), 2) == q],
-            dtype=np.int32,
-        )
+        idx = np.asarray([
+            i for i, row in enumerate(rows)
+            if round(float(row.get("q", 0.0)), 2) == q
+        ], dtype=np.int32)
         if idx.size == 0:
             continue
         w = weights[idx]
-        group_rows.append((
+        grouped.append((
             q,
             weighted_median(src_lab[idx, 0].tolist(), w.tolist()),
-            weighted_median(residual_ab[idx, 0].tolist(), w.tolist()),
-            weighted_median(residual_ab[idx, 1].tolist(), w.tolist()),
+            weighted_median(desired[idx, 0].tolist(), w.tolist()),
+            weighted_median(desired[idx, 1].tolist(), w.tolist()),
+            weighted_median(desired[idx, 2].tolist(), w.tolist()),
             float(np.sum(w)),
         ))
 
-    if len(group_rows) < 3:
+    if len(grouped) < 3:
         return None
 
-    group_rows.sort(key=lambda item: item[1])
-    l_nodes = np.asarray([row[1] for row in group_rows], dtype=np.float64)
-    da_raw = np.asarray([row[2] for row in group_rows], dtype=np.float64)
-    db_raw = np.asarray([row[3] for row in group_rows], dtype=np.float64)
-    node_weights = np.asarray([row[4] for row in group_rows], dtype=np.float64)
+    grouped.sort(key=lambda item: item[1])
+    l_nodes = np.asarray([row[1] for row in grouped], dtype=np.float64)
+    dl_raw = np.asarray([row[2] for row in grouped], dtype=np.float64)
+    da_raw = np.asarray([row[3] for row in grouped], dtype=np.float64)
+    db_raw = np.asarray([row[4] for row in grouped], dtype=np.float64)
+    node_weights = np.asarray([row[5] for row in grouped], dtype=np.float64)
 
-    da = _smooth_weighted_series(da_raw, node_weights, 2.0)
-    db = _smooth_weighted_series(db_raw, node_weights, 2.0)
-    da = np.clip(da, -7.0, 7.0)
-    db = np.clip(db, -7.0, 7.0)
+    # Global Tone owns large L* changes. Skin Color gets only the remaining
+    # local lightness mismatch plus a wider, but still smooth, chroma range.
+    dl = np.clip(
+        _smooth_weighted_series(dl_raw, node_weights, 2.2),
+        -2.0, 2.0,
+    )
+    da = np.clip(
+        _smooth_weighted_series(da_raw, node_weights, 1.25),
+        -9.0, 9.0,
+    )
+    db = np.clip(
+        _smooth_weighted_series(db_raw, node_weights, 1.25),
+        -9.0, 9.0,
+    )
 
     spacing = np.diff(l_nodes)
-    l_sigma = max(7.0, float(np.median(spacing)) * 1.45 if spacing.size else 10.0)
+    l_sigma = max(
+        6.5,
+        float(np.median(spacing)) * 1.35 if spacing.size else 9.0,
+    )
 
     ab = src_lab[:, 1:3]
     ab_center = np.median(ab, axis=0)
@@ -1499,31 +1560,52 @@ def _fit_smooth_skin_model(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
         cov = np.asarray(cov, dtype=np.float64).reshape(2, 2)
     else:
         cov = np.eye(2, dtype=np.float64) * 16.0
-    cov += np.eye(2, dtype=np.float64) * 9.0
+    cov += np.eye(2, dtype=np.float64) * 8.0
     try:
         inv_cov = np.linalg.inv(cov)
     except np.linalg.LinAlgError:
         inv_cov = np.linalg.pinv(cov)
 
-    return {
+    model: Dict[str, Any] = {
         "l_nodes": l_nodes,
+        "delta_l": dl,
         "delta_a": da,
         "delta_b": db,
         "node_weights": node_weights,
         "l_sigma": float(l_sigma),
         "src_lab": src_lab,
+        "weights": weights,
         "ab_center": ab_center,
         "inv_cov": inv_cov,
         "l_low": float(np.percentile(src_lab[:, 0], 3.0) - 8.0),
         "l_high": float(np.percentile(src_lab[:, 0], 97.0) + 8.0),
-        "mean_chroma_delta": float(np.average(
-            np.sqrt(np.sum(residual_ab ** 2, axis=1)),
-            weights=weights,
-        )),
+        "rbf_scale": 0.72,
+        "rbf_sigma_l": 9.0,
+        "rbf_sigma_ab": 11.5,
     }
 
+    # Fit the remaining full-Lab error around the smooth model.
+    base_at_samples = np.asarray(
+        [_smooth_skin_base_delta_lab(lab, model) for lab in src_lab],
+        dtype=np.float64,
+    )
+    rbf_residual = desired - base_at_samples
+    rbf_residual[:, 0] = np.clip(rbf_residual[:, 0], -1.25, 1.25)
+    rbf_residual[:, 1:] = np.clip(rbf_residual[:, 1:], -2.8, 2.8)
 
-def _smooth_skin_delta_lab(lab: Sequence[float], model: Dict[str, Any]) -> np.ndarray:
+    model["rbf_centers"] = src_lab
+    model["rbf_residuals"] = rbf_residual
+    model["mean_lab_delta"] = float(np.average(
+        np.sqrt(np.sum(desired ** 2, axis=1)),
+        weights=weights,
+    ))
+    return model
+
+
+def _smooth_skin_base_delta_lab(
+    lab: Sequence[float],
+    model: Dict[str, Any],
+) -> np.ndarray:
     labv = np.asarray(lab, dtype=np.float64)
     l_nodes = np.asarray(model["l_nodes"], dtype=np.float64)
     node_weights = np.asarray(model["node_weights"], dtype=np.float64)
@@ -1536,53 +1618,152 @@ def _smooth_skin_delta_lab(lab: Sequence[float], model: Dict[str, Any]) -> np.nd
     if support <= 1e-9:
         return np.zeros(3, dtype=np.float64)
 
-    # A small identity prior suppresses unsupported oscillations between anchors.
-    prior = 0.45
-    da = float(np.sum(kernel * np.asarray(model["delta_a"])) / (support + prior))
-    db = float(np.sum(kernel * np.asarray(model["delta_b"])) / (support + prior))
+    # Less attenuation than v0.6. Validation and real-frame collateral control
+    # now decide how much of the supported correction is safe to use.
+    prior = 0.18
+    denom = support + prior
+    return np.asarray([
+        float(np.sum(kernel * np.asarray(model["delta_l"])) / denom),
+        float(np.sum(kernel * np.asarray(model["delta_a"])) / denom),
+        float(np.sum(kernel * np.asarray(model["delta_b"])) / denom),
+    ], dtype=np.float64)
+
+
+def _smooth_skin_rbf_delta_lab(
+    lab: Sequence[float],
+    model: Dict[str, Any],
+) -> np.ndarray:
+    centers_value = model.get("rbf_centers")
+    residuals_value = model.get("rbf_residuals")
+    if centers_value is None or residuals_value is None:
+        return np.zeros(3, dtype=np.float64)
+
+    centers = np.asarray(centers_value, dtype=np.float64)
+    residuals = np.asarray(residuals_value, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[0] == 0:
+        return np.zeros(3, dtype=np.float64)
+
+    labv = np.asarray(lab, dtype=np.float64).reshape(1, 3)
+    diff = centers - labv
+    dl = diff[:, 0] / max(1e-6, float(model.get("rbf_sigma_l", 9.0)))
+    da = diff[:, 1] / max(1e-6, float(model.get("rbf_sigma_ab", 11.5)))
+    db = diff[:, 2] / max(1e-6, float(model.get("rbf_sigma_ab", 11.5)))
+    distance2 = dl * dl + da * da + db * db
+
+    weights_value = model.get("weights")
+    if weights_value is None:
+        weights = np.ones(centers.shape[0], dtype=np.float64)
+    else:
+        weights = np.asarray(weights_value, dtype=np.float64)
+    weights = weights / max(1e-9, float(np.max(weights)))
+
+    kernel = weights * np.exp(-0.5 * distance2)
+    support = float(np.sum(kernel))
+    if support <= 1e-9:
+        return np.zeros(3, dtype=np.float64)
+
+    return (
+        np.sum(kernel[:, None] * residuals, axis=0)
+        / (support + 0.55)
+    )
+
+
+def _smooth_skin_gate(
+    lab: Sequence[float],
+    model: Dict[str, Any],
+) -> float:
+    labv = np.asarray(lab, dtype=np.float64)
 
     ab_delta = labv[1:3] - np.asarray(model["ab_center"], dtype=np.float64)
     mahal2 = float(ab_delta.T @ np.asarray(model["inv_cov"]) @ ab_delta)
-    gamut_gate = math.exp(-0.5 * mahal2 / (2.25 ** 2))
+    gamut_gate = math.exp(-0.5 * mahal2 / (2.60 ** 2))
 
     src_lab = np.asarray(model["src_lab"], dtype=np.float64)
-    # Full-Lab nearest-neighbour protection keeps wood/walls that only happen
-    # to share one chroma coordinate closer to identity.
     scaled = src_lab - labv.reshape(1, 3)
-    scaled[:, 0] *= 0.72
+    scaled[:, 0] *= 0.70
     nearest = float(np.min(np.sqrt(np.sum(scaled ** 2, axis=1))))
-    nearest_gate = math.exp(-0.5 * (nearest / 17.0) ** 2)
+    nearest_gate = math.exp(-0.5 * (nearest / 21.0) ** 2)
 
     chroma = float(math.hypot(labv[1], labv[2]))
-    neutral_gate = float(_smoothstep(np.asarray([chroma]), 5.0, 15.0)[0])
+    neutral_gate = float(
+        _smoothstep(np.asarray([chroma]), 4.5, 13.0)[0]
+    )
 
     l_low = float(model["l_low"])
     l_high = float(model["l_high"])
     l_range_gate = (
-        float(_smoothstep(np.asarray([labv[0]]), l_low, l_low + 10.0)[0])
-        * (1.0 - float(_smoothstep(
-            np.asarray([labv[0]]),
-            l_high - 10.0,
-            l_high,
-        )[0]))
+        float(_smoothstep(np.asarray([labv[0]]), l_low, l_low + 9.0)[0])
+        * (
+            1.0
+            - float(_smoothstep(
+                np.asarray([labv[0]]),
+                l_high - 9.0,
+                l_high,
+            )[0])
+        )
     )
 
-    # User preference: deep shadows barely move; upper mids/highlights may move more.
     shadow_gate = (
-        0.15 * float(_smoothstep(np.asarray([labv[0]]), 18.0, 32.0)[0])
-        + 0.85 * float(_smoothstep(np.asarray([labv[0]]), 32.0, 58.0)[0])
+        0.12 * float(_smoothstep(np.asarray([labv[0]]), 18.0, 30.0)[0])
+        + 0.88 * float(_smoothstep(np.asarray([labv[0]]), 30.0, 55.0)[0])
     )
-    highlight_gate = 1.0 - 0.88 * float(
-        _smoothstep(np.asarray([labv[0]]), 91.0, 99.0)[0]
+    highlight_gate = 1.0 - 0.82 * float(
+        _smoothstep(np.asarray([labv[0]]), 93.0, 99.5)[0]
     )
 
-    gate = float(np.clip(
-        gamut_gate * nearest_gate * neutral_gate
-        * l_range_gate * shadow_gate * highlight_gate,
+    return float(np.clip(
+        gamut_gate
+        * nearest_gate
+        * neutral_gate
+        * l_range_gate
+        * shadow_gate
+        * highlight_gate,
         0.0,
         1.0,
     ))
-    return np.asarray([0.0, da * gate, db * gate], dtype=np.float64)
+
+
+
+def _shadow_lightening_gate(l_value: float) -> float:
+    """Suppress local positive L* changes in facial shadows.
+
+    Global Smooth Tone is the correct place to lift dark skin smoothly.
+    Skin Color / Fine Tune may still correct L* in midtones and highlights,
+    but local shadow lifting is kept near zero to avoid a flattened, broken-
+    curve appearance.
+    """
+    return float(
+        0.03
+        + 0.97
+        * float(_smoothstep(
+            np.asarray([float(l_value)]),
+            46.0,
+            64.0,
+        )[0])
+    )
+
+
+
+def _smooth_skin_delta_lab(
+    lab: Sequence[float],
+    model: Dict[str, Any],
+) -> np.ndarray:
+    base = _smooth_skin_base_delta_lab(lab, model)
+    rbf = _smooth_skin_rbf_delta_lab(lab, model)
+    combined = base + float(model.get("rbf_scale", 0.72)) * rbf
+
+    combined[0] = float(np.clip(combined[0], -2.15, 2.15))
+
+    # v0.7.2 was visually strong and accurate, but local positive L* residuals
+    # could lift facial shadows independently of the global Tone curve.
+    # Suppress only that specific behaviour; preserve the full-Lab correction
+    # everywhere else.
+    labv = np.asarray(lab, dtype=np.float64)
+    if combined[0] > 0.0:
+        combined[0] *= _shadow_lightening_gate(float(labv[0]))
+
+    combined[1:] = np.clip(combined[1:], -10.0, 10.0)
+    return combined * _smooth_skin_gate(labv, model)
 
 
 def _apply_smooth_skin_rgb(
@@ -1593,10 +1774,15 @@ def _apply_smooth_skin_rgb(
     src_lab = _lab_array_from_rgb(
         np.asarray(rgb, dtype=np.float64).reshape(1, 3)
     )[0]
-    corrected_lab = src_lab + float(strength) * _smooth_skin_delta_lab(src_lab, model)
-    return [float(v) for v in _rgb_array_from_lab(
-        corrected_lab.reshape(1, 3)
-    )[0]]
+    corrected_lab = (
+        src_lab
+        + float(strength) * _smooth_skin_delta_lab(src_lab, model)
+    )
+    return [
+        float(v) for v in _rgb_array_from_lab(
+            corrected_lab.reshape(1, 3)
+        )[0]
+    ]
 
 
 def _rows_after_smooth_skin(
@@ -1625,101 +1811,415 @@ def _rows_after_smooth_skin(
     return out
 
 
+def _stratified_skin_folds(
+    rows: List[Dict[str, Any]],
+    fold_count: int = 3,
+) -> List[List[int]]:
+    """Mixed-zone/mixed-tone folds instead of leave-one-zone-out."""
+    zones = sorted(set(str(row.get("zone") or "") for row in rows))
+    quantiles = sorted(set(
+        round(float(row.get("q", 0.0)), 2) for row in rows
+    ))
+    zone_index = {name: i for i, name in enumerate(zones)}
+    q_index = {value: i for i, value in enumerate(quantiles)}
+
+    folds: List[List[int]] = [
+        [] for _ in range(max(2, int(fold_count)))
+    ]
+    for index, row in enumerate(rows):
+        z = zone_index.get(str(row.get("zone") or ""), 0)
+        q = q_index.get(round(float(row.get("q", 0.0)), 2), 0)
+        folds[(q + 2 * z) % len(folds)].append(index)
+    return folds
+
+
 def _skin_cross_validation_scores(
     rows: List[Dict[str, Any]],
     strengths: Sequence[float],
 ) -> Dict[float, float]:
-    zones = sorted(set(str(row.get("zone") or "") for row in rows))
     totals = {float(s): [0.0, 0.0] for s in strengths}
-
+    folds = _stratified_skin_folds(rows, 3)
     valid_folds = 0
-    for held_zone in zones:
-        train = [row for row in rows if str(row.get("zone") or "") != held_zone]
-        held = [row for row in rows if str(row.get("zone") or "") == held_zone]
-        if len(train) < 6 or len(held) < 1:
+
+    for held_indices in folds:
+        held_set = set(held_indices)
+        train = [
+            row for i, row in enumerate(rows) if i not in held_set
+        ]
+        held = [
+            row for i, row in enumerate(rows) if i in held_set
+        ]
+        if len(train) < 6 or len(held) < 2:
             continue
+
         model = _fit_smooth_skin_model(train)
         if model is None:
             continue
         valid_folds += 1
+
         for strength in strengths:
-            after = _rows_after_smooth_skin(held, model, float(strength))
+            after = (
+                held
+                if abs(float(strength)) <= 1e-12
+                else _rows_after_smooth_skin(
+                    held, model, float(strength)
+                )
+            )
             err, weights = _row_delta_e_arrays(after)
-            totals[float(strength)][0] += float(np.sum(err * weights))
+            totals[float(strength)][0] += float(
+                np.sum(err * weights)
+            )
             totals[float(strength)][1] += float(np.sum(weights))
 
     if valid_folds < 2:
         model = _fit_smooth_skin_model(rows)
         if model is None:
-            return {float(s): _rows_delta_e_identity(rows) for s in strengths}
+            baseline = _rows_delta_e_identity(rows)
+            return {float(s): baseline for s in strengths}
         return {
-            float(s): _rows_delta_e_identity(
-                _rows_after_smooth_skin(rows, model, float(s))
+            float(s): (
+                _rows_delta_e_identity(rows)
+                if abs(float(s)) <= 1e-12
+                else _rows_delta_e_identity(
+                    _rows_after_smooth_skin(rows, model, float(s))
+                )
             )
             for s in strengths
         }
 
+    baseline = _rows_delta_e_identity(rows)
     return {
         strength: (
-            total / weight if weight > 0.0 else _rows_delta_e_identity(rows)
+            total / weight if weight > 0.0 else baseline
         )
         for strength, (total, weight) in totals.items()
     }
 
 
+def _sample_collateral_pixels(
+    full_rgb: Optional[np.ndarray],
+    face_bbox: Optional[Sequence[float]],
+    max_pixels: int = 3600,
+) -> np.ndarray:
+    """Sample actual image pixels outside an expanded face area."""
+    if full_rgb is None:
+        return np.empty((0, 3), dtype=np.float64)
+
+    rgb = np.asarray(full_rgb, dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return np.empty((0, 3), dtype=np.float64)
+
+    h, w = rgb.shape[:2]
+    mask = np.ones((h, w), dtype=bool)
+
+    if face_bbox and len(face_bbox) >= 4:
+        x, y, bw, bh = [float(v) for v in face_bbox[:4]]
+        pad_x = bw * 0.35
+        pad_y = bh * 0.42
+        x0 = max(0, int(math.floor(x - pad_x)))
+        y0 = max(0, int(math.floor(y - pad_y)))
+        x1 = min(w, int(math.ceil(x + bw + pad_x)))
+        y1 = min(h, int(math.ceil(y + bh + pad_y)))
+        mask[y0:y1, x0:x1] = False
+
+    pixels = rgb[mask]
+    if pixels.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    useful = (
+        (np.min(pixels, axis=1) >= 4)
+        & (np.max(pixels, axis=1) <= 251)
+    )
+    pixels = pixels[useful]
+    if pixels.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    if pixels.shape[0] > int(max_pixels):
+        step = int(math.ceil(
+            pixels.shape[0] / float(max_pixels)
+        ))
+        pixels = pixels[::step][:int(max_pixels)]
+    return pixels.astype(np.float64)
+
+
+def _prepare_collateral_pixels(
+    pixels: np.ndarray,
+    wb: Optional[Dict[str, Any]],
+    tone_curve: Optional[Sequence[Sequence[float]]],
+) -> np.ndarray:
+    arr = np.asarray(pixels, dtype=np.float64).reshape(-1, 3)
+    if arr.shape[0] == 0:
+        return arr
+
+    out = np.empty_like(arr)
+    for i, rgb in enumerate(arr):
+        value: Sequence[float] = rgb.tolist()
+        if wb and wb.get("enabled"):
+            value = _apply_white_balance_rgb(value, wb)
+        if tone_curve:
+            value = _apply_composite_curve_rgb(value, tone_curve)
+        out[i] = np.asarray(value, dtype=np.float64)
+    return np.clip(out, 0.0, 255.0)
+
+
 def _choose_smooth_skin_strength(
     rows: List[Dict[str, Any]],
     model: Dict[str, Any],
+    lut: Dict[str, Any],
     minimum_gain: float,
+    collateral_pixels: Optional[np.ndarray] = None,
 ) -> Tuple[float, Dict[str, float]]:
+    """Choose strength using the actual exported LUT, not the continuous model."""
     baseline = float(_rows_delta_e_identity(rows))
-    strengths = (0.25, 0.40, 0.55, 0.70, 0.85, 1.00)
-    cv_scores = _skin_cross_validation_scores(rows, strengths)
-    best_strength = min(strengths, key=lambda s: cv_scores[float(s)])
-    best_cv = float(cv_scores[float(best_strength)])
-    best_cv_gain = baseline - best_cv
+    strengths = tuple(round(v / 10.0, 2) for v in range(1, 11))
 
-    if best_cv_gain + 1e-9 < max(0.0, float(minimum_gain)):
+    # CV still tests generalization of the continuous fit.
+    cv_scores = _skin_cross_validation_scores(
+        rows,
+        (0.0,) + strengths,
+    )
+    cv_baseline = float(cv_scores.get(0.0, baseline))
+
+    collateral_pixels = (
+        np.empty((0, 3), dtype=np.float64)
+        if collateral_pixels is None
+        else np.asarray(collateral_pixels, dtype=np.float64).reshape(-1, 3)
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for strength in strengths:
+        actual_rows = _rows_after_lut(rows, lut, float(strength))
+        stats = _stage_stats(rows, actual_rows)
+        cv_after = float(cv_scores[float(strength)])
+        cv_gain = cv_baseline - cv_after
+        collateral = _lut_collateral_stats(
+            collateral_pixels,
+            lut,
+            float(strength),
+        )
+        catastrophic = _collateral_is_catastrophic(
+            collateral,
+            fine_tune=False,
+        )
+
+        valid = bool(
+            stats["gain"] + 1e-9 >= max(0.0, float(minimum_gain))
+            and stats["nonworse_fraction"] >= 0.58
+            and stats["p75_worsening"] <= 0.34
+            and cv_gain + 1e-9 >= max(0.04, float(minimum_gain) * 0.50)
+            and not catastrophic
+        )
+        score = float(
+            stats["after"]
+            + 0.22 * max(0.0, cv_after - stats["after"])
+            + _collateral_penalty(collateral, fine_tune=False)
+        )
+        candidates.append({
+            "strength": float(strength),
+            "rows": actual_rows,
+            "stats": stats,
+            "cv_after": cv_after,
+            "cv_gain": cv_gain,
+            "collateral": collateral,
+            "valid": valid,
+            "score": score,
+        })
+
+    valid_candidates = [item for item in candidates if item["valid"]]
+    if not valid_candidates:
+        best_actual = min(
+            [float(item["stats"]["after"]) for item in candidates],
+            default=baseline,
+        )
+        best_cv = min(
+            [float(cv_scores[s]) for s in strengths],
+            default=cv_baseline,
+        )
         return 0.0, {
             "baseline": baseline,
+            "cv_baseline": cv_baseline,
             "cv_after": best_cv,
-            "cv_gain": best_cv_gain,
-            "full_after": baseline,
-            "full_gain": 0.0,
+            "cv_gain": cv_baseline - best_cv,
+            "full_after": best_actual,
+            "full_gain": max(0.0, baseline - best_actual),
             "nonworse_fraction": 1.0,
+            "collateral_count": 0.0,
+            "collateral_affected_fraction": 0.0,
+            "collateral_mean": 0.0,
+            "collateral_p95": 0.0,
+            "collateral_p99": 0.0,
         }
 
-    # Prefer the weakest strength that retains 90% of the best validated gain.
-    target_cv = baseline - best_cv_gain * 0.90
-    candidates = [
-        s for s in strengths if float(cv_scores[float(s)]) <= target_cv + 1e-9
+    best = min(valid_candidates, key=lambda item: item["score"])
+    best_gain = float(best["stats"]["gain"])
+    near_best = [
+        item for item in valid_candidates
+        if float(item["stats"]["gain"]) >= best_gain * 0.98
+        and float(item["score"]) <= float(best["score"]) + 0.06
     ]
-    chosen = min(candidates) if candidates else best_strength
+    chosen = min(
+        near_best or [best],
+        key=lambda item: item["strength"],
+    )
 
-    after_rows = _rows_after_smooth_skin(rows, model, float(chosen))
-    stats = _stage_stats(rows, after_rows)
-    if (
-        stats["gain"] + 1e-9 < max(0.0, float(minimum_gain))
-        or stats["nonworse_fraction"] < 0.64
-        or stats["p75_worsening"] > 0.22
-    ):
-        return 0.0, {
-            "baseline": baseline,
-            "cv_after": float(cv_scores[float(chosen)]),
-            "cv_gain": baseline - float(cv_scores[float(chosen)]),
-            "full_after": stats["after"],
-            "full_gain": stats["gain"],
-            "nonworse_fraction": stats["nonworse_fraction"],
-        }
-
-    return float(chosen), {
+    stats = chosen["stats"]
+    collateral = chosen["collateral"]
+    return float(chosen["strength"]), {
         "baseline": baseline,
-        "cv_after": float(cv_scores[float(chosen)]),
-        "cv_gain": baseline - float(cv_scores[float(chosen)]),
-        "full_after": stats["after"],
-        "full_gain": stats["gain"],
-        "nonworse_fraction": stats["nonworse_fraction"],
+        "cv_baseline": cv_baseline,
+        "cv_after": float(chosen["cv_after"]),
+        "cv_gain": float(chosen["cv_gain"]),
+        "full_after": float(stats["after"]),
+        "full_gain": float(stats["gain"]),
+        "nonworse_fraction": float(stats["nonworse_fraction"]),
+        "collateral_count": float(collateral.get("count", 0.0)),
+        "collateral_affected_fraction": float(
+            collateral.get("affected_fraction", 0.0)
+        ),
+        "collateral_mean": float(collateral.get("mean", 0.0)),
+        "collateral_p95": float(collateral.get("p95", 0.0)),
+        "collateral_p99": float(collateral.get("p99", 0.0)),
     }
+
+
+
+def _smooth_skin_delta_lab_array(
+    labs: np.ndarray,
+    model: Dict[str, Any],
+    chunk_size: int = 8192,
+) -> np.ndarray:
+    """Vectorized equivalent of _smooth_skin_delta_lab for LUT compilation."""
+    values = np.asarray(labs, dtype=np.float64).reshape(-1, 3)
+    result = np.zeros_like(values)
+
+    l_nodes = np.asarray(model["l_nodes"], dtype=np.float64)
+    node_weights = np.asarray(model["node_weights"], dtype=np.float64)
+    sigma = max(4.0, float(model["l_sigma"]))
+    delta_l = np.asarray(model["delta_l"], dtype=np.float64)
+    delta_a = np.asarray(model["delta_a"], dtype=np.float64)
+    delta_b = np.asarray(model["delta_b"], dtype=np.float64)
+
+    centers = np.asarray(model.get("rbf_centers"), dtype=np.float64)
+    residuals = np.asarray(model.get("rbf_residuals"), dtype=np.float64)
+    src_lab = np.asarray(model["src_lab"], dtype=np.float64)
+    source_weights = np.asarray(model.get("weights"), dtype=np.float64)
+    source_weights = source_weights / max(1e-9, float(np.max(source_weights)))
+
+    ab_center = np.asarray(model["ab_center"], dtype=np.float64)
+    inv_cov = np.asarray(model["inv_cov"], dtype=np.float64)
+    l_low = float(model["l_low"])
+    l_high = float(model["l_high"])
+    rbf_sigma_l = max(1e-6, float(model.get("rbf_sigma_l", 9.0)))
+    rbf_sigma_ab = max(1e-6, float(model.get("rbf_sigma_ab", 11.5)))
+    rbf_scale = float(model.get("rbf_scale", 0.72))
+
+    for start in range(0, values.shape[0], int(chunk_size)):
+        stop = min(values.shape[0], start + int(chunk_size))
+        lab = values[start:stop]
+
+        # Smooth lightness-dependent base.
+        kernel = (
+            np.exp(
+                -0.5
+                * ((lab[:, 0:1] - l_nodes.reshape(1, -1)) / sigma) ** 2
+            )
+            * node_weights.reshape(1, -1)
+        )
+        support = np.sum(kernel, axis=1) + 0.18
+        base = np.stack([
+            kernel @ delta_l,
+            kernel @ delta_a,
+            kernel @ delta_b,
+        ], axis=1) / support[:, None]
+
+        # Local RBF residual.
+        dl = lab[:, None, 0] - centers[None, :, 0]
+        da = lab[:, None, 1] - centers[None, :, 1]
+        db = lab[:, None, 2] - centers[None, :, 2]
+        distance2 = (
+            (dl / rbf_sigma_l) ** 2
+            + (da / rbf_sigma_ab) ** 2
+            + (db / rbf_sigma_ab) ** 2
+        )
+        rbf_kernel = (
+            np.exp(-0.5 * distance2)
+            * source_weights.reshape(1, -1)
+        )
+        rbf_support = np.sum(rbf_kernel, axis=1) + 0.55
+        rbf = (rbf_kernel @ residuals) / rbf_support[:, None]
+
+        combined = base + rbf_scale * rbf
+        combined[:, 0] = np.clip(combined[:, 0], -2.15, 2.15)
+
+        positive_l = combined[:, 0] > 0.0
+        if np.any(positive_l):
+            lift_gate = (
+                0.03
+                + 0.97 * _smoothstep(
+                    lab[:, 0],
+                    46.0,
+                    64.0,
+                )
+            )
+            combined[positive_l, 0] *= lift_gate[positive_l]
+
+        combined[:, 1:] = np.clip(combined[:, 1:], -10.0, 10.0)
+
+        # Same skin-gamut gate as scalar path.
+        ab_delta = lab[:, 1:3] - ab_center.reshape(1, 2)
+        mahal2 = np.einsum(
+            "ni,ij,nj->n",
+            ab_delta,
+            inv_cov,
+            ab_delta,
+        )
+        gamut_gate = np.exp(-0.5 * mahal2 / (2.60 ** 2))
+
+        nearest2 = np.min(
+            (0.70 * dl) ** 2 + da ** 2 + db ** 2,
+            axis=1,
+        )
+        nearest_gate = np.exp(
+            -0.5 * nearest2 / (21.0 ** 2)
+        )
+
+        chroma = np.sqrt(
+            lab[:, 1] ** 2 + lab[:, 2] ** 2
+        )
+        neutral_gate = _smoothstep(chroma, 4.5, 13.0)
+
+        l_range_gate = (
+            _smoothstep(lab[:, 0], l_low, l_low + 9.0)
+            * (
+                1.0
+                - _smoothstep(
+                    lab[:, 0],
+                    l_high - 9.0,
+                    l_high,
+                )
+            )
+        )
+        shadow_gate = (
+            0.12 * _smoothstep(lab[:, 0], 18.0, 30.0)
+            + 0.88 * _smoothstep(lab[:, 0], 30.0, 55.0)
+        )
+        highlight_gate = (
+            1.0
+            - 0.82 * _smoothstep(lab[:, 0], 93.0, 99.5)
+        )
+        gate = np.clip(
+            gamut_gate
+            * nearest_gate
+            * neutral_gate
+            * l_range_gate
+            * shadow_gate
+            * highlight_gate,
+            0.0,
+            1.0,
+        )
+        result[start:stop] = combined * gate[:, None]
+
+    return result
 
 
 def _build_smooth_skin_lut(
@@ -1727,27 +2227,34 @@ def _build_smooth_skin_lut(
     strength: float,
     size: int = 17,
 ) -> Dict[str, Any]:
-    levels = np.linspace(0.0, 255.0, int(size), dtype=np.float64)
-    nodes: List[List[float]] = []
-    outputs: List[List[float]] = []
-    for b in levels:
-        for g in levels:
-            for r in levels:
-                node = np.asarray([r, g, b], dtype=np.float64)
-                node_lab = _lab_array_from_rgb(node.reshape(1, 3))[0]
-                corrected_lab = (
-                    node_lab
-                    + float(strength) * _smooth_skin_delta_lab(node_lab, model)
-                )
-                corrected = _rgb_array_from_lab(corrected_lab.reshape(1, 3))[0]
-                nodes.append(node.tolist())
-                outputs.append(corrected.tolist())
+    """Compile the smooth Lab model to a native RGB LUT in vectorized form."""
+    levels = np.linspace(
+        0.0,
+        255.0,
+        int(size),
+        dtype=np.float64,
+    )
+    b, g, r = np.meshgrid(
+        levels,
+        levels,
+        levels,
+        indexing="ij",
+    )
+    nodes = np.stack(
+        [r, g, b],
+        axis=-1,
+    ).reshape(-1, 3)
+
+    labs = _lab_array_from_rgb(nodes)
+    delta = _smooth_skin_delta_lab_array(labs, model)
+    corrected_lab = labs + float(strength) * delta
+    outputs = _rgb_array_from_lab(corrected_lab)
+
     return {
         "size": int(size),
-        "nodes": np.asarray(nodes, dtype=np.float64),
-        "outputs": np.asarray(outputs, dtype=np.float64),
+        "nodes": nodes.astype(np.float64),
+        "outputs": outputs.astype(np.float64),
     }
-
 
 
 def _anchor_map(model: Dict[str, Any]) -> Dict[Tuple[str, float], Dict[str, Any]]:
@@ -2454,15 +2961,15 @@ def _build_residual_lut(rows: List[Dict[str, Any]], size: int = 17) -> Optional[
     src_lab = _lab_array_from_rgb(src_rgb)
     ref_lab = _lab_array_from_rgb(ref_rgb)
     residual_lab = ref_lab - src_lab
-    residual_lab[:, 0] *= 0.05
-    residual_lab[:, 0] = np.clip(residual_lab[:, 0], -0.8, 0.8)
-    residual_lab[:, 1:] = np.clip(residual_lab[:, 1:], -3.0, 3.0)
+    residual_lab[:, 0] *= 0.22
+    residual_lab[:, 0] = np.clip(residual_lab[:, 0], -1.25, 1.25)
+    residual_lab[:, 1:] = np.clip(residual_lab[:, 1:], -4.0, 4.0)
 
     levels = np.linspace(0.0, 255.0, int(size), dtype=np.float64)
     nodes: List[List[float]] = []
     base_outputs: List[List[float]] = []
-    sigma = 11.0
-    prior = 5.0
+    sigma = 12.5
+    prior = 2.8
     skin_ab_center = np.median(src_lab[:, 1:], axis=0)
     skin_ab_radius = max(10.0, float(np.percentile(np.sqrt(np.sum((src_lab[:, 1:] - skin_ab_center.reshape(1, 2)) ** 2, axis=1)), 85)) * 1.85)
     skin_l_low = float(np.percentile(src_lab[:, 0], 5)) - 8.0
@@ -2476,6 +2983,8 @@ def _build_residual_lut(rows: List[Dict[str, Any]], size: int = 17) -> Optional[
                 local = weights * np.exp(-0.5 * (dist / sigma) ** 2)
                 local_sum = float(np.sum(local))
                 delta = np.sum(local[:, None] * residual_lab, axis=0) / max(prior + local_sum, 1e-9)
+                if delta[0] > 0.0:
+                    delta[0] *= _shadow_lightening_gate(float(node_lab[0]))
                 nearest = float(np.min(dist))
                 distance_gate = math.exp(-0.5 * (nearest / 12.0) ** 2)
                 chroma = float(math.hypot(node_lab[1], node_lab[2]))
@@ -2527,6 +3036,33 @@ def _trilinear_lut(rgb: Sequence[float], lut: Dict[str, Any], strength: float) -
     return [float(v) for v in np.clip(blended, 0.0, 255.0)]
 
 
+
+def _rows_after_lut(
+    rows: List[Dict[str, Any]],
+    lut: Dict[str, Any],
+    strength: float,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        t = row["target"]
+        corrected = _trilinear_lut(
+            [float(t["r"]), float(t["g"]), float(t["b"])],
+            lut,
+            float(strength),
+        )
+        new_t = dict(t)
+        new_t["r"], new_t["g"], new_t["b"] = corrected
+        new_t["y"] = (
+            0.2126 * corrected[0]
+            + 0.7152 * corrected[1]
+            + 0.0722 * corrected[2]
+        )
+        new_row = dict(row)
+        new_row["target"] = new_t
+        out.append(new_row)
+    return out
+
+
 def _score_lut(rows: List[Dict[str, Any]], lut: Dict[str, Any], strength: float) -> float:
     errors: List[float] = []
     weights: List[float] = []
@@ -2538,6 +3074,100 @@ def _score_lut(rows: List[Dict[str, Any]], lut: Dict[str, Any], strength: float)
         weights.append(max(1e-4, float(row.get("weight", 1.0))))
     ea, wa = np.asarray(errors, dtype=np.float64), np.asarray(weights, dtype=np.float64)
     return float(np.sum(ea * wa) / max(1e-9, float(np.sum(wa))))
+
+
+def _lut_collateral_stats(
+    pixels: np.ndarray,
+    lut: Dict[str, Any],
+    strength: float,
+    max_pixels: int = 1400,
+) -> Dict[str, float]:
+    """Measure actual LUT spill on all sampled outside-face pixels."""
+    arr = np.asarray(pixels, dtype=np.float64).reshape(-1, 3)
+    if arr.shape[0] == 0:
+        return {
+            "count": 0.0,
+            "affected_fraction": 0.0,
+            "mean": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0,
+        }
+
+    if arr.shape[0] > int(max_pixels):
+        step = int(math.ceil(arr.shape[0] / float(max_pixels)))
+        arr = arr[::step][:int(max_pixels)]
+
+    before_lab = _lab_array_from_rgb(arr)
+    corrected = np.asarray(
+        [_trilinear_lut(rgb, lut, float(strength)) for rgb in arr],
+        dtype=np.float64,
+    )
+    after_lab = _lab_array_from_rgb(corrected)
+    shifts = np.sqrt(np.sum((after_lab - before_lab) ** 2, axis=1))
+
+    return {
+        "count": float(shifts.size),
+        "affected_fraction": float(np.mean(shifts >= 0.15)) if shifts.size else 0.0,
+        "mean": float(np.mean(shifts)) if shifts.size else 0.0,
+        "p95": float(np.percentile(shifts, 95.0)) if shifts.size else 0.0,
+        "p99": float(np.percentile(shifts, 99.0)) if shifts.size else 0.0,
+        "max": float(np.max(shifts)) if shifts.size else 0.0,
+    }
+
+
+def _collateral_is_catastrophic(
+    stats: Dict[str, float],
+    fine_tune: bool = False,
+) -> bool:
+    """Collateral is a soft preference; only extreme spill is a hard veto."""
+    if float(stats.get("count", 0.0)) < 10:
+        return False
+
+    affected = float(stats.get("affected_fraction", 0.0))
+    p99 = float(stats.get("p99", 0.0))
+    maximum = float(stats.get("max", 0.0))
+    if fine_tune:
+        return bool(
+            maximum > 5.0
+            or (affected > 0.10 and p99 > 2.6)
+        )
+    return bool(
+        maximum > 6.5
+        or (affected > 0.12 and p99 > 3.2)
+    )
+
+
+def _collateral_penalty(
+    stats: Dict[str, float],
+    fine_tune: bool = False,
+) -> float:
+    if float(stats.get("count", 0.0)) < 10:
+        return 0.0
+
+    p95 = float(stats.get("p95", 0.0))
+    p99 = float(stats.get("p99", 0.0))
+    affected = float(stats.get("affected_fraction", 0.0))
+    if fine_tune:
+        return float(
+            0.16 * max(0.0, p95 - 0.35)
+            + 0.08 * max(0.0, p99 - 0.90)
+            + 0.22 * max(0.0, affected - 0.08)
+        )
+    return float(
+        0.12 * max(0.0, p95 - 0.45)
+        + 0.06 * max(0.0, p99 - 1.10)
+        + 0.18 * max(0.0, affected - 0.10)
+    )
+
+
+def _fine_tune_collateral_is_safe(
+    stats: Dict[str, float],
+) -> bool:
+    return not _collateral_is_catastrophic(
+        stats,
+        fine_tune=True,
+    )
 
 
 def _write_cube(lut: Dict[str, Any], strength: float) -> Path:
@@ -2666,6 +3296,7 @@ def fit_smooth_match(
     mode: str,
     use_master: bool,
     minimum_gain: float = 0.1,
+    full_rgb: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Smooth Match pipeline.
 
@@ -2673,6 +3304,8 @@ def fit_smooth_match(
     estimate a smooth skin-chroma field, which is finally baked back into an
     ordinary RGB->RGB Color Lookup profile.
     """
+    # Smooth Tone is part of the pipeline, not a user option.
+    use_master = True
     minimum_gain = float(np.clip(float(minimum_gain), 0.0, 2.0))
     before_original = float(_rows_delta_e_identity(rows))
 
@@ -2699,6 +3332,7 @@ def fit_smooth_match(
     # 2) Smooth Tone fitted ONLY from Lab lightness (L*).
     # --------------------------------------------------------
     tone_curves = None
+    tone_curve = None
     tone_rows = [dict(row) for row in wb_rows]
     after_tone = after_wb
     tone_stats = _stage_stats(wb_rows, tone_rows)
@@ -2731,9 +3365,20 @@ def fit_smooth_match(
             tone_curves = _smooth_tone_curves(tone_curve)
 
     # --------------------------------------------------------
-    # 3) Smooth Lab skin chroma -> RGB Color Lookup.
-    # Cross-validation decides whether/strength.
+    # 3) Smooth full-Lab Skin Color.
+    #
+    # Score exactly the discretized LUT that Photoshop will receive.
     # --------------------------------------------------------
+    collateral_raw = _sample_collateral_pixels(
+        full_rgb,
+        (target_model.get("face") or {}).get("bbox"),
+    )
+    collateral_prepared = _prepare_collateral_pixels(
+        collateral_raw,
+        wb_raw if wb_used else None,
+        tone_curve if tone_curves else None,
+    )
+
     skin_model = _fit_smooth_skin_model(tone_rows)
     skin_strength = 0.0
     skin_lut_info = None
@@ -2741,27 +3386,51 @@ def fit_smooth_match(
     after_skin = after_tone
     skin_diag = {
         "baseline": after_tone,
+        "cv_baseline": after_tone,
         "cv_after": after_tone,
         "cv_gain": 0.0,
         "full_after": after_tone,
         "full_gain": 0.0,
         "nonworse_fraction": 1.0,
+        "collateral_count": 0.0,
+        "collateral_affected_fraction": 0.0,
+        "collateral_mean": 0.0,
+        "collateral_p95": 0.0,
+        "collateral_p99": 0.0,
     }
+    skin_lut = None
 
     if skin_model is not None:
+        # 33^3 materially reduces interpolation/spill error while the native
+        # ICC remains smaller than the old 40^3 profile. LUT compilation is
+        # vectorized, so the denser grid no longer carries the old 40^3 cost.
+        skin_lut = _build_smooth_skin_lut(
+            skin_model,
+            1.0,
+            33,
+        )
         skin_strength, skin_diag = _choose_smooth_skin_strength(
-            tone_rows, skin_model, minimum_gain
+            tone_rows,
+            skin_model,
+            skin_lut,
+            minimum_gain,
+            collateral_prepared,
         )
         if skin_strength > 0.0:
-            skin_rows = _rows_after_smooth_skin(
-                tone_rows, skin_model, skin_strength
+            skin_rows = _rows_after_lut(
+                tone_rows,
+                skin_lut,
+                skin_strength,
             )
             after_skin = float(_rows_delta_e_identity(skin_rows))
-            skin_lut = _build_smooth_skin_lut(
-                skin_model, skin_strength, 17
+            skin_path = _write_cube(
+                skin_lut,
+                skin_strength,
             )
-            skin_path = _write_cube(skin_lut, 1.0)
-            skin_profile = _write_device_link_profile(skin_lut, 1.0)
+            skin_profile = _write_device_link_profile(
+                skin_lut,
+                skin_strength,
+            )
             skin_lut_info = {
                 "path": str(skin_path),
                 "profile_path": str(skin_profile),
@@ -2773,8 +3442,22 @@ def fit_smooth_match(
                 "validation_gain": round(float(skin_diag["cv_gain"]), 3),
             }
 
+    collateral_after_skin = collateral_prepared
+    if (
+        skin_lut is not None
+        and skin_strength > 0.0
+        and collateral_prepared.shape[0] > 0
+    ):
+        collateral_after_skin = np.asarray(
+            [
+                _trilinear_lut(rgb, skin_lut, skin_strength)
+                for rgb in collateral_prepared
+            ],
+            dtype=np.float64,
+        )
+
     # --------------------------------------------------------
-    # 4) Optional very weak residual LUT.
+    # 4) Optional Fine Tune.
     # --------------------------------------------------------
     residual_lut_info = None
     final_de = after_skin
@@ -2783,68 +3466,98 @@ def fit_smooth_match(
     residual_best_de = after_skin
     residual_best_gain = 0.0
     residual_nonworse = 1.0
+    residual_collateral = {
+        "count": 0.0,
+        "affected_fraction": 0.0,
+        "mean": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+    }
 
     if residual_requested:
+        # This residual starts from the actual post-Skin LUT result.
         residual = _build_residual_lut(skin_rows, 17)
         if residual is not None:
-            # Residual is intentionally limited to a weak final trim.
-            for strength in (0.10, 0.20, 0.30, 0.40, 0.50):
-                score = _score_lut(skin_rows, residual, float(strength))
-                if score < residual_best_de - 1e-9:
-                    residual_best_strength = float(strength)
-                    residual_best_de = float(score)
-
-            residual_best_gain = max(
-                0.0, float(after_skin - residual_best_de)
-            )
-
-            if (
-                residual_best_strength > 0.0
-                and residual_best_gain + 1e-9 >= minimum_gain
+            candidates: List[Dict[str, Any]] = []
+            for strength in (
+                0.10, 0.20, 0.30, 0.40, 0.50,
+                0.60, 0.70, 0.80, 0.90, 1.00,
             ):
-                candidate_rows: List[Dict[str, Any]] = []
-                for row in skin_rows:
-                    t = row["target"]
-                    corrected = _trilinear_lut(
-                        [float(t["r"]), float(t["g"]), float(t["b"])],
-                        residual,
-                        residual_best_strength,
+                candidate_rows = _rows_after_lut(
+                    skin_rows,
+                    residual,
+                    float(strength),
+                )
+                stats = _stage_stats(skin_rows, candidate_rows)
+                collateral = _lut_collateral_stats(
+                    collateral_after_skin,
+                    residual,
+                    float(strength),
+                )
+                valid = bool(
+                    stats["gain"] + 1e-9 >= minimum_gain
+                    and stats["nonworse_fraction"] >= 0.62
+                    and stats["p75_worsening"] <= 0.25
+                    and not _collateral_is_catastrophic(
+                        collateral,
+                        fine_tune=True,
                     )
-                    new_t = dict(t)
-                    new_t["r"], new_t["g"], new_t["b"] = corrected
-                    new_t["y"] = (
-                        0.2126 * corrected[0]
-                        + 0.7152 * corrected[1]
-                        + 0.0722 * corrected[2]
+                )
+                score = float(
+                    stats["after"]
+                    + _collateral_penalty(
+                        collateral,
+                        fine_tune=True,
                     )
-                    new_row = dict(row)
-                    new_row["target"] = new_t
-                    candidate_rows.append(new_row)
+                )
+                candidates.append({
+                    "strength": float(strength),
+                    "stats": stats,
+                    "collateral": collateral,
+                    "valid": valid,
+                    "score": score,
+                })
 
-                residual_stats = _stage_stats(skin_rows, candidate_rows)
-                residual_nonworse = residual_stats["nonworse_fraction"]
-                if (
-                    residual_stats["gain"] + 1e-9 >= minimum_gain
-                    and residual_stats["nonworse_fraction"] >= 0.70
-                    and residual_stats["p75_worsening"] <= 0.16
-                ):
-                    residual_path = _write_cube(
-                        residual, residual_best_strength
-                    )
-                    residual_profile = _write_device_link_profile(
-                        residual, residual_best_strength
-                    )
-                    residual_lut_info = {
-                        "path": str(residual_path),
-                        "profile_path": str(residual_profile),
-                        "profile_grid": int(residual["size"]),
-                        "strength": round(residual_best_strength, 3),
-                        "delta_e_before": round(float(after_skin), 3),
-                        "delta_e_after": round(
-                            float(residual_stats["after"]), 3
-                        ),
-                    }
-                    final_de = float(residual_stats["after"])
+            valid_candidates = [
+                item for item in candidates if item["valid"]
+            ]
+            if valid_candidates:
+                best = min(valid_candidates, key=lambda item: item["score"])
+                best_gain = float(best["stats"]["gain"])
+                near_best = [
+                    item for item in valid_candidates
+                    if float(item["stats"]["gain"]) >= best_gain * 0.98
+                    and float(item["score"]) <= float(best["score"]) + 0.04
+                ]
+                chosen = min(
+                    near_best or [best],
+                    key=lambda item: item["strength"],
+                )
+
+                residual_best_strength = float(chosen["strength"])
+                residual_best_de = float(chosen["stats"]["after"])
+                residual_best_gain = float(chosen["stats"]["gain"])
+                residual_nonworse = float(chosen["stats"]["nonworse_fraction"])
+                residual_collateral = chosen["collateral"]
+
+                residual_path = _write_cube(
+                    residual,
+                    residual_best_strength,
+                )
+                residual_profile = _write_device_link_profile(
+                    residual,
+                    residual_best_strength,
+                )
+                residual_lut_info = {
+                    "path": str(residual_path),
+                    "profile_path": str(residual_profile),
+                    "profile_grid": int(residual["size"]),
+                    "strength": round(residual_best_strength, 3),
+                    "delta_e_before": round(float(after_skin), 3),
+                    "delta_e_after": round(float(residual_best_de), 3),
+                }
+                final_de = residual_best_de
 
     diagnostics = {
         "delta_e_before": round(before_original, 3),
@@ -2903,6 +3616,25 @@ def fit_smooth_match(
         "skin_nonworse_fraction": round(
             float(skin_diag["nonworse_fraction"]), 3
         ),
+        "skin_validation_baseline": round(
+            float(skin_diag.get("cv_baseline", after_tone)), 3
+        ),
+        "skin_collateral_pixels": int(
+            skin_diag.get("collateral_count", 0.0)
+        ),
+        "skin_collateral_affected_fraction": round(
+            float(skin_diag.get("collateral_affected_fraction", 0.0)),
+            4,
+        ),
+        "skin_collateral_mean": round(
+            float(skin_diag.get("collateral_mean", 0.0)), 3
+        ),
+        "skin_collateral_p95": round(
+            float(skin_diag.get("collateral_p95", 0.0)), 3
+        ),
+        "skin_collateral_p99": round(
+            float(skin_diag.get("collateral_p99", 0.0)), 3
+        ),
 
         "residual_lut_requested": bool(residual_requested),
         "residual_lut_used": bool(residual_lut_info),
@@ -2914,6 +3646,19 @@ def fit_smooth_match(
         ),
         "residual_lut_nonworse_fraction": round(
             float(residual_nonworse), 3
+        ),
+        "fine_tune_collateral_affected_fraction": round(
+            float(residual_collateral.get("affected_fraction", 0.0)),
+            4,
+        ),
+        "fine_tune_collateral_mean": round(
+            float(residual_collateral.get("mean", 0.0)), 3
+        ),
+        "fine_tune_collateral_p95": round(
+            float(residual_collateral.get("p95", 0.0)), 3
+        ),
+        "fine_tune_collateral_p99": round(
+            float(residual_collateral.get("p99", 0.0)), 3
         ),
 
         "correspondences": len(rows),
@@ -3130,7 +3875,7 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
     preset_id = str(message.get("preset_id") or "")
     preset_path = str(message.get("preset_path") or "")
     mode = str(message.get("mode") or "parametric").lower()
-    use_master = bool(message.get("use_master", True))
+    use_master = True
     minimum_gain = float(message.get("minimum_gain", 0.1) or 0.0)
     minimum_gain = float(np.clip(minimum_gain, 0.0, 2.0))
     if mode not in {"parametric", "residual_lut"}:
@@ -3139,8 +3884,18 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
     path, preset = resolve_preset(preset_folder, preset_id, preset_path)
     image = imread_unicode(image_path)
     target_model = analyze_face(image)
-    rows = build_correspondences(target_model, preset["reference_model"])
-    result, diagnostics = fit_smooth_match(rows, target_model, mode, use_master, minimum_gain)
+    rows = build_correspondences(
+        target_model, preset["reference_model"]
+    )
+    full_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    result, diagnostics = fit_smooth_match(
+        rows,
+        target_model,
+        mode,
+        use_master,
+        minimum_gain,
+        full_rgb=full_rgb,
+    )
     return {
         "preset": preset_summary(path, preset),
         "wb_curves": result.get("wb_curves"),
@@ -3224,6 +3979,7 @@ def idle_watcher() -> None:
 
 
 def start_server() -> None:
+    cleanup_stale_temp_payloads()
     if (sys.version_info.major, sys.version_info.minor) not in SUPPORTED_PYTHON:
         write_startup_status(
             "error",
@@ -3301,6 +4057,7 @@ def start_server() -> None:
         except OSError:
             pass
         _write_log(f"{APP_NAME} stopped")
+        cleanup_clean_shutdown_files()
 
 
 if __name__ == "__main__":
