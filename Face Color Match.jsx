@@ -35,8 +35,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.13.1",
-            uuid: "db558f66-6e38-41e7-a274-70537f4632af",
+            version: "0.13.2",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
@@ -588,9 +587,16 @@ function faceColorMatchApplyHistory() {
             temp.previewSize = preview;
             temp.skipNoFace = !!skip.value;
             temp.layerName = layer || "Face Color Match";
-            cfg.data = temp;
-            cfg.ensurePresetFolder();
-            w.close(1);
+            var previous = cfg.data;
+            try {
+                cfg.data = temp;
+                cfg.ensurePresetFolder();
+                cfg.save();
+                w.close(1);
+            } catch (e) {
+                cfg.data = previous;
+                alert(errorText(e), APP.name, true);
+            }
         };
 
         cancel.onClick = function () { w.close(0); };
@@ -746,11 +752,14 @@ function faceColorMatchApplyHistory() {
 
     function applyMatchResult(result, groupName, opacity) {
         var doc = app.activeDocument,
-            group = doc.layerSets.add(),
+            group = null,
+            storedSelection = null,
             skinLut = result.skin_lut || null,
             created = 0;
 
         try {
+            storedSelection = storeSelectionForAdjustmentLayers(doc);
+            group = doc.layerSets.add();
             try { group.name = groupName; } catch (_) { }
             try {
                 group.opacity = Math.max(0, Math.min(100, Number(opacity)));
@@ -798,69 +807,75 @@ function faceColorMatchApplyHistory() {
 
             try { doc.activeLayer = group; } catch (_) { }
         } catch (e) {
-            try { group.remove(); } catch (_) { }
+            if (group) try { group.remove(); } catch (_) { }
             throw e;
         } finally {
             // Python-created LUT payloads are only transport files. Photoshop
             // embeds both CUBE data and the device-link ICC into the adjustment
             // layer, so they are never needed after this apply attempt.
             removeLutTempFiles(skinLut);
+            restoreStoredSelection(doc, storedSelection);
         }
+    }
+
+    function storeSelectionForAdjustmentLayers(doc) {
+        var hasSelection = false, channel = null;
+        try { var bounds = doc.selection.bounds; hasSelection = !!bounds; }
+        catch (_) { hasSelection = false; }
+        if (!hasSelection) return null;
+        try {
+            channel = doc.channels.add();
+            channel.name = "__FaceColorMatchSelection__";
+            doc.selection.store(channel);
+            doc.selection.deselect();
+            return channel;
+        } catch (e) {
+            if (channel) {
+                try { doc.selection.load(channel, SelectionType.REPLACE); } catch (_) { }
+                try { channel.remove(); } catch (_) { }
+            }
+            throw new Error(str.selectionPreserveFailed + "\n" + errorText(e));
+        }
+    }
+
+    function restoreStoredSelection(doc, channel) {
+        if (!channel) return;
+        try { doc.selection.load(channel, SelectionType.REPLACE); } catch (_) { }
+        try { channel.remove(); } catch (_) { }
     }
 
     function createCurvesLayer(curves, useMaster, name, opacity, parentGroup) {
-        var doc = app.activeDocument,
-            storedChannel = null,
-            hadSelection = false;
+        var make = new ActionDescriptor(),
+            ref = new ActionReference(),
+            using = new ActionDescriptor(),
+            curveType = new ActionDescriptor(),
+            adjustments = new ActionList();
+        ref.putClass(c2t("AdjL"));
+        make.putReference(c2t("null"), ref);
+        if (useMaster) adjustments.putObject(c2t("CrvA"), curveChannel("Cmps", curves.composite || [[0, 0], [255, 255]]));
+        adjustments.putObject(c2t("CrvA"), curveChannel("Rd  ", curves.red));
+        adjustments.putObject(c2t("CrvA"), curveChannel("Grn ", curves.green));
+        adjustments.putObject(c2t("CrvA"), curveChannel("Bl  ", curves.blue));
+        curveType.putList(c2t("Adjs"), adjustments);
+        using.putObject(c2t("Type"), c2t("Crvs"), curveType);
+        make.putObject(c2t("Usng"), c2t("AdjL"), using);
+        executeAction(c2t("Mk  "), make, DialogModes.NO);
+        try { app.activeDocument.activeLayer.name = name; } catch (_) { }
         try {
-            try { var bounds = doc.selection.bounds; hadSelection = !!bounds; } catch (_) { hadSelection = false; }
-            if (hadSelection) {
-                try {
-                    storedChannel = doc.channels.add();
-                    storedChannel.name = "__FaceColorMatchSelection__";
-                    doc.selection.store(storedChannel);
-                } catch (_) { storedChannel = null; }
-                try { doc.selection.deselect(); } catch (_) { }
-            }
-
-            var make = new ActionDescriptor(),
-                ref = new ActionReference(),
-                using = new ActionDescriptor(),
-                curveType = new ActionDescriptor(),
-                adjustments = new ActionList();
-            ref.putClass(c2t("AdjL"));
-            make.putReference(c2t("null"), ref);
-            if (useMaster) adjustments.putObject(c2t("CrvA"), curveChannel("Cmps", curves.composite || [[0, 0], [255, 255]]));
-            adjustments.putObject(c2t("CrvA"), curveChannel("Rd  ", curves.red));
-            adjustments.putObject(c2t("CrvA"), curveChannel("Grn ", curves.green));
-            adjustments.putObject(c2t("CrvA"), curveChannel("Bl  ", curves.blue));
-            curveType.putList(c2t("Adjs"), adjustments);
-            using.putObject(c2t("Type"), c2t("Crvs"), curveType);
-            make.putObject(c2t("Usng"), c2t("AdjL"), using);
-            executeAction(c2t("Mk  "), make, DialogModes.NO);
-            try { app.activeDocument.activeLayer.name = name; } catch (_) { }
-            try {
-                var op = Number(opacity);
-                if (isNaN(op)) op = 100;
-                app.activeDocument.activeLayer.opacity = Math.max(0, Math.min(100, op));
-            } catch (_) { }
-            if (parentGroup) {
-                try { app.activeDocument.activeLayer.move(parentGroup, ElementPlacement.INSIDE); } catch (_) { }
-            }
-        } finally {
-            if (storedChannel) {
-                try { doc.selection.load(storedChannel, SelectionType.REPLACE); } catch (_) { }
-                try { storedChannel.remove(); } catch (_) { }
-            }
+            var op = Number(opacity);
+            if (isNaN(op)) op = 100;
+            app.activeDocument.activeLayer.opacity = Math.max(0, Math.min(100, op));
+        } catch (_) { }
+        if (parentGroup) {
+            try { app.activeDocument.activeLayer.move(parentGroup, ElementPlacement.INSIDE); } catch (_) { }
         }
     }
+
 
     function createColorLookupLayer(cubePath, profilePath, name, opacity, parentGroup) {
         var doc = app.activeDocument,
             cubeFile = new File(cubePath),
             profileFile = new File(profilePath),
-            storedChannel = null,
-            hadSelection = false,
             layer = null,
             cubeOpened = false,
             profileOpened = false;
@@ -869,16 +884,6 @@ function faceColorMatchApplyHistory() {
         if (!profilePath || !profileFile.exists) throw new Error(str.lutProfileMissing + "\n" + profilePath);
 
         try {
-            try { var bounds = doc.selection.bounds; hadSelection = !!bounds; } catch (_) { hadSelection = false; }
-            if (hadSelection) {
-                try {
-                    storedChannel = doc.channels.add();
-                    storedChannel.name = "__FaceColorMatchSelection__";
-                    doc.selection.store(storedChannel);
-                } catch (_) { storedChannel = null; }
-                try { doc.selection.deselect(); } catch (_) { }
-            }
-
             // Create the empty Color Lookup adjustment layer.
             var make = new ActionDescriptor(),
                 makeRef = new ActionReference(),
@@ -909,9 +914,8 @@ function faceColorMatchApplyHistory() {
                 throw new Error(str.lutProfileInvalid + "\n" + profilePath);
 
             // This descriptor mirrors the successful manual CUBE load captured
-            // by ScriptingListener. The crucial difference from v0.2.4 is that
-            // "profile" is now a complete RGB->RGB device-link ICC generated by
-            // Python from the same generated LUT.
+            // by ScriptingListener. "profile" is a complete RGB->RGB device-link
+            // ICC generated by Python from the same LUT.
             var setDesc = new ActionDescriptor(),
                 target = new ActionReference(),
                 lookup = new ActionDescriptor();
@@ -965,10 +969,6 @@ function faceColorMatchApplyHistory() {
             try { if (cubeFile.exists) cubeFile.remove(); } catch (_) { }
             try { if (profileFile.exists) profileFile.remove(); } catch (_) { }
 
-            if (storedChannel) {
-                try { doc.selection.load(storedChannel, SelectionType.REPLACE); } catch (_) { }
-                try { storedChannel.remove(); } catch (_) { }
-            }
         }
     }
 
@@ -998,7 +998,14 @@ function faceColorMatchApplyHistory() {
                 restartOldServer = false;
 
             if (checkConnection(APP.apiHost, APP.apiPortSend)) {
-                runningInfo = self.ping();
+                try {
+                    runningInfo = self.ping();
+                } catch (e) {
+                    throw new Error(
+                        str.apiPortBusy + " " + APP.apiPortSend +
+                        "\n" + errorText(e)
+                    );
+                }
                 if (
                     runningInfo &&
                     String(runningInfo.version || "") == String(APP.version)
@@ -1123,9 +1130,6 @@ function faceColorMatchApplyHistory() {
                 update_mode: String(updateMode || "replace"),
                 face_selection_mode: String(faceSelectionMode || "main")
             }, 45000);
-        };
-        this.deletePreset = function (folder, presetId, presetPath) {
-            return call("delete_preset", { preset_folder: folder, preset_id: presetId, preset_path: presetPath }, 10000);
         };
         this.match = function (imagePath, data) {
             return call("match", {
@@ -1610,7 +1614,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Измерить текущий документ и создать новый пресет",
                 strengthHelp: "Общая сила применения найденной коррекции. 100% — полный эффект, меньшие значения ослабляют все созданные корректирующие слои как одну группу.",
                 lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
-                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto и полностью сохраняет обычную логику. Чем дальше в сторону «Точность», тем сильнее алгоритм стремится к минимальному ΔE: плавно ослабляются cross-validation и защита окружающих цветов, расширяется внутренняя доводка и максимальная сила Skin Match растёт до 150%. Крайнее положение «Точность» соответствует прежнему режиму «Агрессивная коррекция». В сторону «Защита» максимальная сила Skin Match снижается до 60%, а проверки становятся строже.",
+                protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. Чем дальше в сторону «Точность», тем сильнее алгоритм стремится к минимальному ΔE: плавно ослабляются cross-validation и защита окружающих цветов, расширяется внутренняя доводка и максимальная сила Skin Match растёт до 150%. В сторону «Защита» максимальная сила Skin Match снижается до 60%, а проверки становятся строже.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Измерить текущий документ: добавить его к усреднённому эталону или полностью заменить эталон",
                 presetNamePrompt: "Имя нового пресета:",
@@ -1653,6 +1657,7 @@ function faceColorMatchApplyHistory() {
                 pythonStartFailed: "Не удалось запустить Python-сервер.",
                 pythonTimeout: "Python-сервер не запустился за отведённое время.",
                 pythonConnection: "Нет соединения с локальным Python API.",
+                apiPortBusy: "Локальный API-порт занят процессом, который не отвечает как Face Color Match:",
                 listenerError: "Не удалось открыть локальный порт ответа: ",
                 apiTimeout: "Истекло время ожидания ответа Python API.",
                 apiError: "Ошибка Python API.",
@@ -1665,7 +1670,8 @@ function faceColorMatchApplyHistory() {
                 lutProfileMissing: "Не найден временный ICC profile для LUT.",
                 lutReadFailed: "Не удалось прочитать LUT.",
                 lutProfileReadFailed: "Не удалось прочитать ICC profile LUT.",
-                lutProfileInvalid: "ICC profile LUT повреждён или слишком мал."
+                lutProfileInvalid: "ICC profile LUT повреждён или слишком мал.",
+                selectionPreserveFailed: "Не удалось безопасно сохранить активное выделение. Коррекция отменена."
             },
             E = {
                 noDocument: "No document is open.",
@@ -1684,7 +1690,7 @@ function faceColorMatchApplyHistory() {
                 createPresetHelp: "Measure the current document and create a new preset",
                 strengthHelp: "Overall strength of the fitted correction. 100% keeps the full effect; lower values reduce the opacity of the created adjustment group.",
                 lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
-                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto and preserves the normal behavior exactly. Moving toward Accuracy progressively prioritizes minimum ΔE: cross-validation and surrounding-colour protection are relaxed, internal refinement gets more freedom, and maximum Skin Match strength rises to 150%. The far Accuracy endpoint matches the former Aggressive correction mode. Moving toward Safety reduces maximum Skin Match strength to 60% and makes validation stricter.",
+                protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Moving toward Accuracy progressively prioritizes minimum ΔE: cross-validation and surrounding-colour protection are relaxed, internal refinement gets more freedom, and maximum Skin Match strength rises to 150%. Moving toward Safety reduces maximum Skin Match strength to 60% and makes validation stricter.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Measure the current document: add it to the averaged reference or replace the reference completely",
                 presetNamePrompt: "New preset name:",
@@ -1727,6 +1733,7 @@ function faceColorMatchApplyHistory() {
                 pythonStartFailed: "Could not start the Python server.",
                 pythonTimeout: "The Python server did not start in time.",
                 pythonConnection: "Could not connect to the local Python API.",
+                apiPortBusy: "The local API port is occupied by a process that is not responding as Face Color Match:",
                 listenerError: "Could not open the local reply port: ",
                 apiTimeout: "Timed out waiting for the Python API.",
                 apiError: "Python API error.",

@@ -51,14 +51,26 @@ echo.
 echo Checking NumPy and OpenCV...
 py -%PYVER% -c "import cv2,numpy; assert hasattr(cv2,'FaceDetectorYN_create'); print('Existing modules OK:', 'OpenCV',cv2.__version__,'NumPy',numpy.__version__)" >nul 2>nul
 if errorlevel 1 (
-  echo Installing required packages into system Python %PYVER%...
-  py -%PYVER% -m pip install --upgrade pip
-  if errorlevel 1 goto :fail
+  echo Installing required packages for Python %PYVER%...
+  py -%PYVER% -m pip --version >nul 2>nul
+  if errorlevel 1 (
+    echo Preparing pip...
+    py -%PYVER% -m ensurepip --upgrade
+    if errorlevel 1 goto :fail
+  )
 
   if "%PYVER%"=="3.11" (
     py -%PYVER% -m pip install --upgrade "numpy==2.4.6" "opencv-python-headless==4.14.0.94"
+    if errorlevel 1 (
+      echo System Python packages are not writable or installation failed. Retrying for the current user...
+      py -%PYVER% -m pip install --user --upgrade "numpy==2.4.6" "opencv-python-headless==4.14.0.94"
+    )
   ) else (
     py -%PYVER% -m pip install --upgrade "numpy==2.5.2" "opencv-python-headless==4.14.0.94"
+    if errorlevel 1 (
+      echo System Python packages are not writable or installation failed. Retrying for the current user...
+      py -%PYVER% -m pip install --user --upgrade "numpy==2.5.2" "opencv-python-headless==4.14.0.94"
+    )
   )
   if errorlevel 1 goto :fail
 ) else (
