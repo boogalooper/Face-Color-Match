@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "Face Color Match"
-VERSION = "0.15.10"
+VERSION = "0.15.15"
 API_PROTOCOL = 1
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 42971
@@ -3065,19 +3065,20 @@ def _prepare_collateral_pixels(
     pixels: np.ndarray,
     tone_curve: Optional[Sequence[Sequence[float]]],
     wb_curves: Optional[Dict[str, Sequence[Sequence[float]]]] = None,
+    neutral_lut: Optional[Dict[str, Any]] = None,
+    neutral_strength: float = 0.0,
 ) -> np.ndarray:
     arr = np.asarray(pixels, dtype=np.float64).reshape(-1, 3)
     if arr.shape[0] == 0:
         return arr
 
-    out = np.empty_like(arr)
-    for i, rgb in enumerate(arr):
-        value: Sequence[float] = rgb.tolist()
-        if wb_curves:
-            value = _apply_curve_set_rgb(value, wb_curves)
-        if tone_curve:
-            value = _apply_composite_curve_rgb(value, tone_curve)
-        out[i] = np.asarray(value, dtype=np.float64)
+    out = arr.copy()
+    if wb_curves:
+        out = _apply_curve_set_array(out, wb_curves)
+    if neutral_lut is not None and float(neutral_strength) > 0.0:
+        out = _apply_lut_array(out, neutral_lut, neutral_strength)
+    if tone_curve:
+        out = _apply_curve_set_array(out, _smooth_tone_curves(tone_curve))
     return np.clip(out, 0.0, 255.0)
 
 
@@ -3750,6 +3751,169 @@ def _smoothstep(value: np.ndarray, low: float, high: float) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _neutral_protection_gate(labs: np.ndarray) -> np.ndarray:
+    """Fade Skin Match to identity around gray/white colours.
+
+    The gate is intentionally based on the source colour, not the correction
+    direction. Near-neutral Lab colours are protected completely, while normal
+    skin chroma is left essentially untouched. Bright low-chroma colours get
+    an additional white-object guard.
+    """
+    values = np.asarray(labs, dtype=np.float64).reshape(-1, 3)
+    chroma = np.sqrt(np.sum(values[:, 1:3] ** 2, axis=1))
+    neutral = _smoothstep(chroma, 6.0, 15.0)
+    bright = _smoothstep(values[:, 0], 78.0, 96.0)
+    coloured_highlight = _smoothstep(chroma, 12.0, 24.0)
+    white_guard = 1.0 - bright * (1.0 - coloured_highlight)
+    return np.clip(neutral * white_guard, 0.0, 1.0)
+
+
+def _inverse_curve_values(
+    curve: Sequence[Sequence[float]],
+    values: np.ndarray,
+) -> np.ndarray:
+    """Invert a strictly monotonic Photoshop curve by interpolation."""
+    points = np.asarray(curve, dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] < 2:
+        return np.asarray(values, dtype=np.float64).copy()
+    x = points[:, 0]
+    y = points[:, 1]
+    return np.interp(
+        np.asarray(values, dtype=np.float64),
+        y,
+        x,
+    )
+
+
+def _inverse_curve_set_array(
+    pixels: np.ndarray,
+    curves: Dict[str, Sequence[Sequence[float]]],
+) -> np.ndarray:
+    """Approximate RGB values before a monotonic WB Curves layer."""
+    arr = np.clip(
+        np.asarray(pixels, dtype=np.float64).reshape(-1, 3),
+        0.0,
+        255.0,
+    )
+    if arr.shape[0] == 0:
+        return arr.copy()
+
+    out = arr.copy()
+    composite = curves.get("composite") or [[0, 0], [255, 255]]
+    if not _curve_is_identity(composite):
+        out = _inverse_curve_values(composite, out)
+    for index, name in enumerate(("red", "green", "blue")):
+        curve = curves.get(name) or [[0, 0], [255, 255]]
+        out[:, index] = _inverse_curve_values(curve, out[:, index])
+    return np.clip(out, 0.0, 255.0)
+
+
+def _neutral_restore_weight(source_lab: np.ndarray) -> np.ndarray:
+    """0..1 protection weight from the colour before White Balance."""
+    return np.clip(
+        1.0 - _neutral_protection_gate(source_lab),
+        0.0,
+        1.0,
+    )
+
+
+def _apply_neutral_restore_array(
+    wb_pixels: np.ndarray,
+    wb_curves: Dict[str, Sequence[Sequence[float]]],
+    strength: float = 1.0,
+) -> np.ndarray:
+    """Undo WB chroma only for colours that were neutral before WB.
+
+    Lightness is taken from the WB result, while a*/b* are restored toward the
+    colour before WB. This prevents a neutral-protection layer from undoing the
+    useful tonal component of the WB curves. ``strength`` models Photoshop layer
+    opacity; the exported LUT itself is always the full-strength mapping.
+    """
+    post = np.clip(
+        np.asarray(wb_pixels, dtype=np.float64).reshape(-1, 3),
+        0.0,
+        255.0,
+    )
+    if post.shape[0] == 0:
+        return post.copy()
+    amount = float(np.clip(float(strength), 0.0, 1.0))
+    if amount <= 0.0 or _curve_set_is_identity(wb_curves):
+        return post.copy()
+
+    source = _inverse_curve_set_array(post, wb_curves)
+    source_lab = _lab_array_from_rgb(source)
+    post_lab = _lab_array_from_rgb(post)
+    restored_lab = post_lab.copy()
+    restored_lab[:, 1:] = source_lab[:, 1:]
+    restored_rgb = _rgb_array_from_lab(restored_lab)
+    weight = _neutral_restore_weight(source_lab)[:, None]
+    full = post + weight * (restored_rgb - post)
+    return np.clip(
+        post + amount * (full - post),
+        0.0,
+        255.0,
+    )
+
+
+def _build_neutral_restore_lut(
+    wb_curves: Dict[str, Sequence[Sequence[float]]],
+    size: int = 33,
+) -> Dict[str, Any]:
+    """Compile the full-strength WB-neutralization transform to an RGB LUT."""
+    levels = np.linspace(0.0, 255.0, int(size), dtype=np.float64)
+    b, g, r = np.meshgrid(levels, levels, levels, indexing="ij")
+    nodes = np.stack([r, g, b], axis=-1).reshape(-1, 3)
+    outputs = _apply_neutral_restore_array(nodes, wb_curves, 1.0)
+    return {
+        "size": int(size),
+        "nodes": nodes,
+        "outputs": np.clip(outputs, 0.0, 255.0),
+    }
+
+
+def _build_safe_neutral_restore_lut(
+    wb_curves: Dict[str, Sequence[Sequence[float]]],
+    size: int = 33,
+) -> Dict[str, Any]:
+    """Compile Neutral Protect and backtrack only if its 3-D geometry folds.
+
+    Neutral Protect intentionally changes only a narrow low-chroma region. With
+    a strong White Balance correction, a full inverse-chroma mapping can become
+    too steep at the neutral/coloured transition even though all sampled skin
+    anchors look reasonable.  Bake the strongest geometry-safe fraction into
+    the LUT itself; the user-facing 0..100 slider remains a simple Photoshop
+    layer-opacity control on top of this safe endpoint.
+    """
+    raw = _build_neutral_restore_lut(wb_curves, size)
+    full_stats = _lut_geometry_stats(raw, 1.0)
+    if _lut_geometry_is_safe(full_stats, 0.0):
+        safe_strength = 1.0
+    else:
+        low, high = 0.0, 1.0
+        for _ in range(14):
+            mid = 0.5 * (low + high)
+            stats = _lut_geometry_stats(raw, mid)
+            if _lut_geometry_is_safe(stats, 0.0):
+                low = mid
+            else:
+                high = mid
+        # Leave a small numerical margin between the accepted grid and the
+        # boundary. This also absorbs tiny ICC/Photoshop interpolation deltas.
+        safe_strength = max(0.0, min(1.0, low * 0.985))
+
+    nodes = np.asarray(raw["nodes"], dtype=np.float64)
+    outputs = np.asarray(raw["outputs"], dtype=np.float64)
+    baked_outputs = nodes + safe_strength * (outputs - nodes)
+    baked = {
+        "size": int(raw["size"]),
+        "nodes": nodes.copy(),
+        "outputs": np.clip(baked_outputs, 0.0, 255.0),
+        "neutral_internal_strength": float(safe_strength),
+    }
+    baked["neutral_geometry"] = _lut_geometry_stats(baked, 1.0)
+    return baked
+
+
 def _build_residual_refinement_lut(
     rows: List[Dict[str, Any]],
     size: int = 17,
@@ -3931,7 +4095,6 @@ def _build_residual_refinement_lut(
         0.0,
         1.0,
     )
-
     corrected_lab = node_lab.copy()
     corrected_lab[:, 0] += delta[:, 0] * lightness_gate
     corrected_lab[:, 1:] += delta[:, 1:] * chroma_gate[:, None]
@@ -4564,12 +4727,16 @@ def _worst_zone_delta_e(rows: List[Dict[str, Any]]) -> Tuple[str, float]:
 def _rows_after_pipeline(
     rows: List[Dict[str, Any]],
     wb_curves: Optional[Dict[str, Sequence[Sequence[float]]]] = None,
+    neutral_lut: Optional[Dict[str, Any]] = None,
+    neutral_strength: float = 0.0,
     tone_curve: Optional[Sequence[Sequence[float]]] = None,
     skin_lut: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     current = [dict(row) for row in rows]
     if wb_curves:
         current = _rows_after_curve_set(current, wb_curves)
+    if neutral_lut is not None and float(neutral_strength) > 0.0:
+        current = _rows_after_lut(current, neutral_lut, neutral_strength)
     if tone_curve:
         current = _rows_after_tone_curve(current, tone_curve)
     if skin_lut is not None:
@@ -4772,6 +4939,7 @@ def _joint_rgb_values(
     template_model: Dict[str, Any],
     knot_positions: np.ndarray,
     protection_bias: float,
+    neutral_protection: float = 0.0,
 ) -> np.ndarray:
     rgb = np.asarray([
         [float(row["target"][key]) for key in ("r", "g", "b")]
@@ -4779,6 +4947,13 @@ def _joint_rgb_values(
     ], dtype=np.float64)
     wb_curves = _joint_params_to_wb_curves(params, protection_bias)
     rgb = _apply_curve_set_array(rgb, wb_curves)
+    neutral_strength = float(np.clip(float(neutral_protection) / 100.0, 0.0, 1.0))
+    if neutral_strength > 0.0 and not _curve_set_is_identity(wb_curves):
+        # Coordinate descent uses the continuous transform for speed. The exact
+        # 33^3 LUT is compiled and revalidated before a candidate is accepted.
+        rgb = _apply_neutral_restore_array(
+            rgb, wb_curves, neutral_strength
+        )
     tone_curve = _joint_params_to_tone_curve(params)
     rgb = _apply_curve_set_array(rgb, _smooth_tone_curves(tone_curve))
     model = _joint_params_to_skin_model(params, template_model, knot_positions)
@@ -4953,6 +5128,7 @@ def _optimize_joint_accuracy(
     knot_positions: np.ndarray,
     protection_bias: float,
     lightness_balance: float = 0.0,
+    neutral_protection: float = 0.0,
 ) -> Tuple[JointMatchParams, Dict[str, Any]]:
     """Deterministic low-dimensional coordinate descent for Accuracy mode."""
     accuracy_mix = _accuracy_profile_mix(protection_bias)
@@ -4961,10 +5137,12 @@ def _optimize_joint_accuracy(
 
     def evaluate(params: JointMatchParams) -> Dict[str, Any]:
         fit_rgb = _joint_rgb_values(
-            fit_rows, params, template_model, knot_positions, protection_bias
+            fit_rows, params, template_model, knot_positions, protection_bias,
+            neutral_protection=neutral_protection,
         )
         validation_rgb = _joint_rgb_values(
-            validation_rows, params, template_model, knot_positions, protection_bias
+            validation_rows, params, template_model, knot_positions, protection_bias,
+            neutral_protection=neutral_protection,
         )
         fit_errors, fit_weights = _joint_error_arrays(fit_rows, fit_rgb)
         val_errors, val_weights = _joint_error_arrays(validation_rows, validation_rgb)
@@ -5106,25 +5284,45 @@ def _compile_joint_candidate(
     knot_positions: np.ndarray,
     protection_bias: float,
     minimum_gain: float,
+    neutral_protection: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
-    """Compile and validate the actual 9-point curves + 33^3 LUT."""
+    """Compile and validate the actual curves + neutral LUT + 33^3 skin LUT."""
     wb_curves = _joint_params_to_wb_curves(params, protection_bias)
     tone_curve = _joint_params_to_tone_curve(params)
     tone_curves = _smooth_tone_curves(tone_curve)
+    neutral_strength = float(np.clip(float(neutral_protection) / 100.0, 0.0, 1.0))
+    neutral_lut = (
+        _build_safe_neutral_restore_lut(wb_curves, 33)
+        if neutral_strength > 0.0 and not _curve_set_is_identity(wb_curves)
+        else None
+    )
 
     wb_pixels = _apply_curve_set_array(collateral_raw, wb_curves)
     if not _global_stage_pixel_safety(collateral_raw, wb_pixels, protection_bias)["safe"]:
         return None
-    tone_pixels = _apply_curve_set_array(wb_pixels, tone_curves)
-    if not _global_stage_pixel_safety(wb_pixels, tone_pixels, protection_bias)["safe"]:
+    neutral_pixels = (
+        _apply_lut_array(wb_pixels, neutral_lut, neutral_strength)
+        if neutral_lut is not None else wb_pixels
+    )
+    tone_pixels = _apply_curve_set_array(neutral_pixels, tone_curves)
+    if not _global_stage_pixel_safety(neutral_pixels, tone_pixels, protection_bias)["safe"]:
         return None
 
-    fit_global = _rows_after_tone_curve(_rows_after_curve_set(fit_rows, wb_curves), tone_curve)
-    validation_global = _rows_after_tone_curve(_rows_after_curve_set(validation_rows, wb_curves), tone_curve)
+    fit_after_wb = _rows_after_curve_set(fit_rows, wb_curves)
+    validation_after_wb = _rows_after_curve_set(validation_rows, wb_curves)
+    if neutral_lut is not None:
+        fit_after_wb = _rows_after_lut(fit_after_wb, neutral_lut, neutral_strength)
+        validation_after_wb = _rows_after_lut(
+            validation_after_wb, neutral_lut, neutral_strength
+        )
+    fit_global = _rows_after_tone_curve(fit_after_wb, tone_curve)
+    validation_global = _rows_after_tone_curve(validation_after_wb, tone_curve)
     collateral_prepared = _prepare_collateral_pixels(
         collateral_raw,
         tone_curve if not _curve_is_identity(tone_curve) else None,
         wb_curves if not _curve_set_is_identity(wb_curves) else None,
+        neutral_lut,
+        neutral_strength,
     )
     if collateral_prepared.shape[0] > 1400:
         step = int(math.ceil(collateral_prepared.shape[0] / 1400.0))
@@ -5165,6 +5363,8 @@ def _compile_joint_candidate(
         return {
             "params": _copy_joint_params(candidate_params),
             "wb_curves": None if _curve_set_is_identity(wb_curves) else wb_curves,
+            "neutral_lut": neutral_lut,
+            "neutral_strength": neutral_strength,
             "tone_curve": None if _curve_is_identity(tone_curve) else tone_curve,
             "tone_curves": None if _curve_is_identity(tone_curve) else tone_curves,
             "fit_global": fit_global,
@@ -5197,6 +5397,8 @@ def _compile_joint_candidate(
         return {
             "params": _copy_joint_params(params),
             "wb_curves": None if _curve_set_is_identity(wb_curves) else wb_curves,
+            "neutral_lut": neutral_lut,
+            "neutral_strength": neutral_strength,
             "tone_curve": None if _curve_is_identity(tone_curve) else tone_curve,
             "tone_curves": None if _curve_is_identity(tone_curve) else tone_curves,
             "fit_global": fit_global,
@@ -5359,11 +5561,14 @@ def fit_smooth_match(
     full_rgb: Optional[np.ndarray] = None,
     lightness_balance: float = 0.0,
     protection_bias: float = 0.0,
+    neutral_protection: float = 0.0,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """v0.15 pipeline: pooled fit -> spatial validation -> Accuracy joint fit."""
     minimum_gain = float(np.clip(float(minimum_gain), 0.0, 2.0))
     lightness_balance = float(np.clip(float(lightness_balance), -100.0, 100.0))
     protection_bias = float(np.clip(float(protection_bias), -100.0, 100.0))
+    neutral_protection = float(np.clip(float(neutral_protection), 0.0, 100.0))
+    neutral_strength = neutral_protection / 100.0
     protection = _protection_profile(protection_bias, minimum_gain)
     accuracy_mix = float(protection["accuracy_mix"])
     # Accuracy starts from one stable Auto baseline.  Previously WB/Tone/Skin
@@ -5411,19 +5616,45 @@ def fit_smooth_match(
         and wb_validation_safe
         and wb_pixel_safety["safe"]
     )
+    neutral_lut: Optional[Dict[str, Any]] = None
     if wb_used:
         wb_curves = wb_candidate_curves
-        wb_fit_rows = wb_candidate_fit
-        wb_validation_rows = wb_candidate_validation
+        # Keep an unprotected WB stream for deciding whether Tone exists.
+        # Neutral Protect is an optional corrective layer and must not silently
+        # make an otherwise valid Tone layer disappear when its opacity changes.
+        wb_tone_fit_rows = [dict(row) for row in wb_candidate_fit]
+        wb_tone_validation_rows = [dict(row) for row in wb_candidate_validation]
+        wb_tone_collateral_pixels = wb_collateral_pixels.copy()
+
+        # Downstream Skin Match sees the actual layer stack, including Neutral
+        # Protect. Tone itself is selected independently and then applied to
+        # this protected stream.
+        wb_fit_rows = [dict(row) for row in wb_candidate_fit]
+        wb_validation_rows = [dict(row) for row in wb_candidate_validation]
         after_wb = float(wb_fit_stats["after"])
+        if neutral_strength > 0.0:
+            neutral_lut = _build_safe_neutral_restore_lut(wb_curves, 33)
+            wb_fit_rows = _rows_after_lut(
+                wb_fit_rows, neutral_lut, neutral_strength
+            )
+            wb_validation_rows = _rows_after_lut(
+                wb_validation_rows, neutral_lut, neutral_strength
+            )
+            wb_collateral_pixels = _apply_lut_array(
+                wb_collateral_pixels, neutral_lut, neutral_strength
+            )
     else:
         wb_curves = None
+        wb_tone_fit_rows = [dict(row) for row in fit_rows]
+        wb_tone_validation_rows = [dict(row) for row in validation_rows]
+        wb_tone_collateral_pixels = collateral_raw.copy()
         wb_fit_rows = [dict(row) for row in fit_rows]
         wb_validation_rows = [dict(row) for row in validation_rows]
         wb_collateral_pixels = collateral_raw.copy()
         after_wb = before_original
         wb_fit_stats = _stage_stats(fit_rows, wb_fit_rows)
         wb_validation_stats = _stage_stats(validation_rows, wb_validation_rows)
+    after_neutral = float(_rows_delta_e_identity(wb_fit_rows))
 
     # --------------------------------------------------------
     # 2) Tone: still conservative alone; joint Accuracy can revisit it.
@@ -5443,29 +5674,53 @@ def fit_smooth_match(
         "high_offset": 0.0,
     }
     candidate_tone_curve, candidate_tone_diag = _optimize_lightness_tone(
-        wb_fit_rows, minimum_gain, lightness_balance
+        wb_tone_fit_rows, minimum_gain, lightness_balance
     )
     if candidate_tone_diag.get("used"):
-        candidate_fit = _rows_after_tone_curve(wb_fit_rows, candidate_tone_curve)
-        candidate_validation = _rows_after_tone_curve(
-            wb_validation_rows, candidate_tone_curve
+        # Decide Tone exactly as if Neutral Protect were at 0%. This keeps
+        # Neutral Protect a separate layer control instead of a hidden switch
+        # that can remove Tone at high values.
+        candidate_tone_fit = _rows_after_tone_curve(
+            wb_tone_fit_rows, candidate_tone_curve
+        )
+        candidate_tone_validation = _rows_after_tone_curve(
+            wb_tone_validation_rows, candidate_tone_curve
         )
         validation_safe, _candidate_validation_stats = _validation_stage_is_safe(
-            wb_validation_rows, candidate_validation, baseline_protection_bias, "tone"
+            wb_tone_validation_rows,
+            candidate_tone_validation,
+            baseline_protection_bias,
+            "tone",
         )
         candidate_tone_curves = _smooth_tone_curves(candidate_tone_curve)
         candidate_pixels = _apply_curve_set_array(
-            wb_collateral_pixels, candidate_tone_curves
+            wb_tone_collateral_pixels, candidate_tone_curves
         )
         pixel_safe = _global_stage_pixel_safety(
-            wb_collateral_pixels, candidate_pixels, baseline_protection_bias
+            wb_tone_collateral_pixels, candidate_pixels, baseline_protection_bias
         )["safe"]
         if validation_safe and pixel_safe:
             tone_curve = candidate_tone_curve
             tone_curves = candidate_tone_curves
-            tone_fit_rows = candidate_fit
-            tone_validation_rows = candidate_validation
-            tone_diag = candidate_tone_diag
+            # Apply the accepted Tone to the actual protected layer stream.
+            tone_fit_rows = _rows_after_tone_curve(
+                wb_fit_rows, candidate_tone_curve
+            )
+            tone_validation_rows = _rows_after_tone_curve(
+                wb_validation_rows, candidate_tone_curve
+            )
+            tone_diag = dict(candidate_tone_diag)
+            actual_light = _lightness_stage_stats(
+                wb_fit_rows,
+                tone_fit_rows,
+                lightness_balance,
+            )
+            tone_diag["lightness_before"] = float(actual_light["before"])
+            tone_diag["lightness_after"] = float(actual_light["after"])
+            tone_diag["lightness_gain"] = float(actual_light["gain"])
+            tone_diag["lightness_nonworse_fraction"] = float(
+                actual_light["nonworse_fraction"]
+            )
     tone_stats = _stage_stats(wb_fit_rows, tone_fit_rows)
     after_tone = float(_rows_delta_e_identity(tone_fit_rows))
 
@@ -5476,6 +5731,8 @@ def fit_smooth_match(
         collateral_raw,
         tone_curve if tone_curves else None,
         wb_curves if wb_used else None,
+        neutral_lut,
+        neutral_strength,
     )
     if collateral_prepared.shape[0] > 1400:
         step = int(math.ceil(collateral_prepared.shape[0] / 1400.0))
@@ -5565,6 +5822,7 @@ def fit_smooth_match(
             knot_positions,
             -100.0,
             lightness_balance,
+            neutral_protection,
         )
         joint_diag = dict(endpoint_diag)
         joint_diag["endpoint_accuracy"] = -100.0
@@ -5584,6 +5842,7 @@ def fit_smooth_match(
                 knot_positions,
                 protection_bias,
                 skin_minimum_gain,
+                neutral_protection,
             )
             if compiled is not None:
                 compiled_fit_de = float(_rows_delta_e_identity(compiled["fit_rows"]))
@@ -5601,6 +5860,10 @@ def fit_smooth_match(
                     joint_compiled = True
                     wb_curves = compiled["wb_curves"]
                     wb_used = bool(wb_curves)
+                    neutral_lut = compiled.get("neutral_lut")
+                    neutral_strength = float(compiled.get(
+                        "neutral_strength", neutral_strength
+                    ))
                     tone_curve = compiled["tone_curve"]
                     tone_curves = compiled["tone_curves"]
                     tone_fit_rows = compiled["fit_global"]
@@ -5615,11 +5878,6 @@ def fit_smooth_match(
                     collateral_before_lab = compiled["collateral_before_lab"]
                     joint_backtrack = float(compiled["skin_backtrack"])
                     primary_skin_strength = joint_backtrack
-                    after_wb = float(_rows_delta_e_identity(
-                        _rows_after_curve_set(fit_rows, wb_curves)
-                        if wb_curves else fit_rows
-                    ))
-                    after_tone = float(_rows_delta_e_identity(tone_fit_rows))
                     wb_actual_fit_rows = (
                         _rows_after_curve_set(fit_rows, wb_curves)
                         if wb_curves else [dict(row) for row in fit_rows]
@@ -5628,17 +5886,31 @@ def fit_smooth_match(
                         _rows_after_curve_set(validation_rows, wb_curves)
                         if wb_curves else [dict(row) for row in validation_rows]
                     )
+                    after_wb = float(_rows_delta_e_identity(wb_actual_fit_rows))
+                    neutral_actual_fit_rows = [dict(row) for row in wb_actual_fit_rows]
+                    neutral_actual_validation_rows = [dict(row) for row in wb_actual_validation_rows]
+                    if neutral_lut is not None and neutral_strength > 0.0:
+                        neutral_actual_fit_rows = _rows_after_lut(
+                            neutral_actual_fit_rows, neutral_lut, neutral_strength
+                        )
+                        neutral_actual_validation_rows = _rows_after_lut(
+                            neutral_actual_validation_rows, neutral_lut, neutral_strength
+                        )
+                    after_neutral = float(_rows_delta_e_identity(
+                        neutral_actual_fit_rows
+                    ))
+                    after_tone = float(_rows_delta_e_identity(tone_fit_rows))
                     wb_validation_stats = _stage_stats(
                         validation_rows,
                         wb_actual_validation_rows,
                     )
                     tone_stats = _stage_stats(
-                        wb_actual_fit_rows,
+                        neutral_actual_fit_rows,
                         tone_fit_rows,
                     )
                     if tone_curves:
                         tone_light = _lightness_stage_stats(
-                            wb_actual_fit_rows,
+                            neutral_actual_fit_rows,
                             tone_fit_rows,
                             lightness_balance,
                         )
@@ -5802,6 +6074,19 @@ def fit_smooth_match(
     # --------------------------------------------------------
     # 6) Final validation on the actually compiled 33^3 LUT, then export.
     # --------------------------------------------------------
+    neutral_lut_info = None
+    if neutral_lut is not None and neutral_strength > 0.0:
+        neutral_path = _write_cube(neutral_lut, 1.0)
+        neutral_profile = _write_device_link_profile(neutral_lut, 1.0)
+        neutral_lut_info = {
+            "path": str(neutral_path),
+            "profile_path": str(neutral_profile),
+            "profile_grid": int(neutral_lut["size"]),
+            "opacity": round(float(neutral_strength * 100.0), 1),
+            "delta_e_before": round(float(after_wb), 3),
+            "delta_e_after": round(float(after_neutral), 3),
+        }
+
     skin_lut_info = None
     if final_skin_lut is not None:
         final_fit_stats = _stage_stats(tone_fit_rows, final_fit_rows)
@@ -5853,6 +6138,8 @@ def fit_smooth_match(
     legacy_after_rows = _rows_after_pipeline(
         legacy_zone_rows,
         wb_curves,
+        neutral_lut,
+        neutral_strength,
         tone_curve,
         final_skin_lut,
     )
@@ -5862,6 +6149,7 @@ def fit_smooth_match(
     diagnostics = {
         "delta_e_before": round(before_original, 3),
         "delta_e_after_wb": round(after_wb, 3),
+        "delta_e_after_neutral": round(after_neutral, 3),
         "delta_e_after_tone": round(after_tone, 3),
         "delta_e_after_skin": round(final_de, 3),
         "delta_e_after": round(final_de, 3),
@@ -5878,6 +6166,18 @@ def fit_smooth_match(
         "skin_minimum_gain": round(skin_minimum_gain, 3),
         "lightness_balance": round(lightness_balance, 1),
         "protection_bias": round(protection_bias, 1),
+        "neutral_protection": round(neutral_protection, 1),
+        "neutral_protect_used": bool(neutral_lut_info),
+        "neutral_internal_strength": round(float(
+            (neutral_lut or {}).get("neutral_internal_strength", 1.0)
+            if neutral_lut is not None else 0.0
+        ), 4),
+        "neutral_geometry_folded_cells": round(float(
+            ((neutral_lut or {}).get("neutral_geometry") or {}).get("folded_cells", 0.0)
+        ), 3),
+        "neutral_geometry_min_determinant": round(float(
+            ((neutral_lut or {}).get("neutral_geometry") or {}).get("min_determinant", 1.0)
+        ), 4),
         "accuracy_profile_mix": round(accuracy_mix, 4),
         "protection_max_skin_strength": round(float(protection["max_skin_strength"]), 3),
         "protection_max_refinement_strength": round(float(protection["max_refinement_strength"]), 3),
@@ -5937,6 +6237,7 @@ def fit_smooth_match(
 
     return {
         "wb_curves": wb_curves,
+        "neutral_lut": neutral_lut_info,
         "tone_curves": tone_curves,
         "skin_lut": skin_lut_info,
     }, diagnostics
@@ -6987,6 +7288,9 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
     preview_size = int(message.get("preview_size", 1400) or 1400)
     lightness_balance = float(message.get("lightness_balance", 0.0) or 0.0)
     protection_bias = float(message.get("protection_bias", 0.0) or 0.0)
+    neutral_protection = float(
+        np.clip(float(message.get("neutral_protection", 0.0) or 0.0), 0.0, 100.0)
+    )
     face_selection_mode = _normalize_face_selection_mode(
         message.get("face_selection_mode")
     )
@@ -7020,10 +7324,12 @@ def command_match(message: Dict[str, Any]) -> Dict[str, Any]:
         full_rgb=full_rgb,
         lightness_balance=lightness_balance,
         protection_bias=protection_bias,
+        neutral_protection=neutral_protection,
     )
     return {
         "preset": preset_summary(path, preset),
         "wb_curves": result.get("wb_curves"),
+        "neutral_lut": result.get("neutral_lut"),
         "tone_curves": result.get("tone_curves"),
         "skin_lut": result.get("skin_lut"),
         "diagnostics": diagnostics,

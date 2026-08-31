@@ -11,6 +11,8 @@
             /strength [(strength) /integer]
             /lightnessBalance [(lightness balance) /integer]
             /protectionBias [(accuracy safety balance) /integer]
+            /neutralProtection [(neutral protection) /integer]
+            /protectNeutrals [(legacy protect neutral colors) /boolean]
             /faceSelectionMode [(face selection mode) /string]
             /layerName [(layer name) /string]
             /skipNoFace [(skip if no face) /boolean]
@@ -35,7 +37,7 @@ function faceColorMatchApplyHistory() {
 (function () {
     var APP = {
             name: "Face Color Match",
-            version: "0.15.10",
+            version: "0.15.15",
             apiFile: "face-color-api",
             apiHost: "127.0.0.1",
             apiPortSend: 42971,
@@ -102,11 +104,11 @@ function faceColorMatchApplyHistory() {
     function UI() {
         var self = this;
 
-        this.mainWindowWidth = 410;
+        this.mainWindowWidth = 420;
         this.labelWidth = 118;
         this.mainSettingsButtonWidth = 28;
         this.presetButtonWidth = 28;
-        this.sliderWidth = 220;
+        this.sliderWidth = 210;
         this.sliderValueWidth = 46;
         this.progressWidth = 330;
 
@@ -236,7 +238,7 @@ function faceColorMatchApplyHistory() {
             header = w.add("group{orientation:'row',alignChildren:['fill','center'],spacing:0}"),
             tHeader = header.add("statictext", undefined, documentSummary()),
             bSettings = header.add("button", undefined, "⚙"),
-            presetGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:0}"),
+            presetGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
             tPreset = presetGroup.add("statictext", undefined, str.preset),
             ddPreset = presetGroup.add("dropdownlist"),
             bAdd = presetGroup.add("button", undefined, "+"),
@@ -257,30 +259,37 @@ function faceColorMatchApplyHistory() {
             tProtection = protectionGroup.add("statictext", undefined, str.protectionBias),
             slProtection = protectionGroup.add("slider", undefined, cfg.data.protectionBias, -100, 100),
             tProtectionValue = protectionGroup.add("statictext", undefined, ""),
+            neutralGroup = w.add("group{orientation:'row',alignChildren:['left','center'],spacing:5}"),
+            tNeutral = neutralGroup.add("statictext", undefined, str.neutralProtection),
+            slNeutral = neutralGroup.add("slider", undefined, cfg.data.neutralProtection, 0, 100),
+            tNeutralValue = neutralGroup.add("statictext", undefined, ""),
             gOk = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,6,0,0]}"),
             bOk = gOk.add("button", undefined, str.apply, { name: "ok" }),
             bCancel = gOk.add("button", undefined, str.cancel, { name: "cancel" }),
             toneStepper = ui.createSliderStepper(slTone, 1, 0),
-            protectionStepper = ui.createSliderStepper(slProtection, 1, 0);
+            protectionStepper = ui.createSliderStepper(slProtection, 1, 0),
+            neutralStepper = ui.createSliderStepper(slNeutral, 1, 0);
 
         ui.setFixedWidth(w, ui.mainWindowWidth);
-        tHeader.alignment = ["fill", "left"];
-        bSettings.alignment = ["left", "center"];
+        tHeader.alignment = ["fill", "center"];
+        bSettings.alignment = ["right", "center"];
         ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
-        ui.setFixedWidth(tPreset, ui.labelWidth+5);
-        ui.setFixedWidth(tHeader, ui.labelWidth+235);
+        ui.setFixedWidth(tPreset, ui.labelWidth);
         ui.setFixedWidth(tFaceMode, ui.labelWidth);
         ui.setFixedWidth(tStrength, ui.labelWidth);
         ui.setFixedWidth(tTone, ui.labelWidth);
         ui.setFixedWidth(tProtection, ui.labelWidth);
-        ui.setFixedWidth(ddPreset, 175);
-        ui.setFixedWidth(ddFaceMode, 175);
+        ui.setFixedWidth(tNeutral, ui.labelWidth);
+        ui.setFixedWidth(ddPreset, 160);
+        ui.setFixedWidth(ddFaceMode, 210);
         ui.setFixedWidth(slStrength, ui.sliderWidth);
         ui.setFixedWidth(slTone, ui.sliderWidth);
         ui.setFixedWidth(slProtection, ui.sliderWidth);
+        ui.setFixedWidth(slNeutral, ui.sliderWidth);
         ui.setFixedWidth(tStrengthValue, ui.sliderValueWidth);
         ui.setFixedWidth(tToneValue, ui.sliderValueWidth);
         ui.setFixedWidth(tProtectionValue, ui.sliderValueWidth);
+        ui.setFixedWidth(tNeutralValue, ui.sliderValueWidth);
         ui.setFixedWidth(bAdd, ui.presetButtonWidth);
         ui.setFixedWidth(bUpdate, ui.presetButtonWidth);
         ui.setFixedWidth(bDelete, ui.presetButtonWidth);
@@ -292,6 +301,7 @@ function faceColorMatchApplyHistory() {
         tStrength.helpTip = slStrength.helpTip = tStrengthValue.helpTip = str.strengthHelp;
         tTone.helpTip = slTone.helpTip = tToneValue.helpTip = str.lightnessBalanceHelp;
         tProtection.helpTip = slProtection.helpTip = tProtectionValue.helpTip = str.protectionBiasHelp;
+        tNeutral.helpTip = slNeutral.helpTip = tNeutralValue.helpTip = str.neutralProtectionHelp;
 
         function selectedPreset() {
             if (!ddPreset.selection) return null;
@@ -351,12 +361,20 @@ function faceColorMatchApplyHistory() {
             if (finalize) cfg.data.protectionBias = Math.round(value);
             tProtectionValue.text = ui.centeredSliderText(value);
         }
+        function syncNeutralText(finalize) {
+            var value = finalize ? neutralStepper.finish() : neutralStepper.sync(false);
+            value = Math.max(0, Math.min(100, Math.round(value)));
+            if (finalize) cfg.data.neutralProtection = value;
+            tNeutralValue.text = String(value) + "%";
+        }
         repopulate(cfg.data.selectedPresetId);
         repopulateFaceMode();
         toneStepper.reset(Number(cfg.data.lightnessBalance) || 0);
         protectionStepper.reset(Number(cfg.data.protectionBias) || 0);
+        neutralStepper.reset(Number(cfg.data.neutralProtection) || 0);
         syncToneText(false);
         syncProtectionText(false);
+        syncNeutralText(false);
 
         ddPreset.onChange = function () {
             var item = selectedPreset();
@@ -371,6 +389,8 @@ function faceColorMatchApplyHistory() {
         slTone.onChange = function () { syncToneText(true); };
         slProtection.onChanging = function () { syncProtectionText(false); };
         slProtection.onChange = function () { syncProtectionText(true); };
+        slNeutral.onChanging = function () { syncNeutralText(false); };
+        slNeutral.onChange = function () { syncNeutralText(true); };
 
         bAdd.onClick = function () {
             var defaultName = stripExtension(app.activeDocument.name),
@@ -451,6 +471,7 @@ function faceColorMatchApplyHistory() {
             cfg.data.strength = Math.round(slStrength.value);
             syncToneText(true);
             syncProtectionText(true);
+            syncNeutralText(true);
             var oldFolder = cfg.data.presetFolder;
             if (settingsDialog()) {
                 if (oldFolder != cfg.data.presetFolder) refreshPresets(cfg.data.selectedPresetId);
@@ -458,8 +479,10 @@ function faceColorMatchApplyHistory() {
                 tStrengthValue.text = String(Math.round(cfg.data.strength)) + "%";
                 toneStepper.reset(Number(cfg.data.lightnessBalance) || 0);
                 protectionStepper.reset(Number(cfg.data.protectionBias) || 0);
+                neutralStepper.reset(Number(cfg.data.neutralProtection) || 0);
                 syncToneText(false);
                 syncProtectionText(false);
+                syncNeutralText(false);
             }
         };
 
@@ -471,6 +494,7 @@ function faceColorMatchApplyHistory() {
             cfg.data.faceSelectionMode = selectedFaceMode();
             syncToneText(true);
             syncProtectionText(true);
+            syncNeutralText(true);
             w.close(1);
         };
         bCancel.onClick = function () { w.close(0); };
@@ -787,7 +811,9 @@ function faceColorMatchApplyHistory() {
             deBefore = null,
             deAfter = null;
         if (diag) {
-            if (diag.delta_e_after_wb !== undefined)
+            if (diag.delta_e_after_neutral !== undefined)
+                deBefore = diag.delta_e_after_neutral;
+            else if (diag.delta_e_after_wb !== undefined)
                 deBefore = diag.delta_e_after_wb;
             else if (diag.delta_e_before !== undefined)
                 deBefore = diag.delta_e_before;
@@ -806,6 +832,17 @@ function faceColorMatchApplyHistory() {
             return name;
         }
         return "Tone";
+    }
+
+    function neutralProtectLayerName(lut) {
+        if (
+            lut && lut.delta_e_before !== undefined &&
+            lut.delta_e_after !== undefined
+        ) {
+            return "Neutral Protect ΔE " + oneDecimal(lut.delta_e_before) + "→" +
+                oneDecimal(lut.delta_e_after);
+        }
+        return "Neutral Protect";
     }
 
     function skinMatchLayerName(lut) {
@@ -910,6 +947,7 @@ function faceColorMatchApplyHistory() {
         var doc = app.activeDocument,
             group = null,
             storedSelection = null,
+            neutralLut = result.neutral_lut || null,
             skinLut = result.skin_lut || null,
             created = 0;
 
@@ -927,6 +965,17 @@ function faceColorMatchApplyHistory() {
                     false,
                     whiteBalanceLayerName(result),
                     100,
+                    group
+                );
+                created++;
+            }
+
+            if (neutralLut && neutralLut.path) {
+                createColorLookupLayer(
+                    String(neutralLut.path),
+                    String(neutralLut.profile_path || ""),
+                    neutralProtectLayerName(neutralLut),
+                    Number(neutralLut.opacity),
                     group
                 );
                 created++;
@@ -969,6 +1018,7 @@ function faceColorMatchApplyHistory() {
             // Python-created LUT payloads are only transport files. Photoshop
             // embeds both CUBE data and the device-link ICC into the adjustment
             // layer, so they are never needed after this apply attempt.
+            removeLutTempFiles(neutralLut);
             removeLutTempFiles(skinLut);
             restoreStoredSelection(doc, storedSelection);
         }
@@ -1312,6 +1362,7 @@ function faceColorMatchApplyHistory() {
                 preview_size: parseInt(data.previewSize, 10) || 1400,
                 lightness_balance: parseInt(data.lightnessBalance, 10) || 0,
                 protection_bias: parseInt(data.protectionBias, 10) || 0,
+                neutral_protection: Math.max(0, Math.min(100, parseInt(data.neutralProtection, 10) || 0)),
                 face_selection_mode: String(data.faceSelectionMode || "main")
             // Accuracy computes a full endpoint before interpolating the
             // requested value.  Keep the listener alive on slower CPUs rather
@@ -1418,11 +1469,12 @@ function faceColorMatchApplyHistory() {
             if (isNaN(strength)) strength = 100;
 
             return {
-                actionDataVersion: 11,
+                actionDataVersion: 13,
                 selectedPresetId: String(cfg.data.selectedPresetId || ""),
                 strength: Math.round(strength),
                 lightnessBalance: Math.round(Number(cfg.data.lightnessBalance) || 0),
                 protectionBias: Math.round(Number(cfg.data.protectionBias) || 0),
+                neutralProtection: Math.max(0, Math.min(100, Math.round(Number(cfg.data.neutralProtection) || 0))),
                 faceSelectionMode: String(cfg.data.faceSelectionMode || "main"),
                 layerName: String(cfg.data.layerName || "Face Color Match"),
                 skipNoFace: !!cfg.data.skipNoFace
@@ -1476,6 +1528,10 @@ function faceColorMatchApplyHistory() {
                 cfg.data.lightnessBalance = Number(values.lightnessBalance);
             if (values.protectionBias !== undefined)
                 cfg.data.protectionBias = Number(values.protectionBias);
+            if (values.neutralProtection !== undefined)
+                cfg.data.neutralProtection = Number(values.neutralProtection);
+            else
+                cfg.data.neutralProtection = 0;
             if (values.faceSelectionMode !== undefined)
                 cfg.data.faceSelectionMode = String(values.faceSelectionMode || "main");
             if (values.layerName !== undefined)
@@ -1665,6 +1721,9 @@ function faceColorMatchApplyHistory() {
                 Number(loaded.settingsVersion) !== SETTINGS_VERSION
             ) return;
 
+            if (loaded.neutralProtection === undefined)
+                loaded.neutralProtection = 0;
+
             if (
                 loaded.presetFolder === undefined ||
                 loaded.selectedPresetId === undefined ||
@@ -1672,6 +1731,7 @@ function faceColorMatchApplyHistory() {
                 loaded.strength === undefined ||
                 loaded.lightnessBalance === undefined ||
                 loaded.protectionBias === undefined ||
+                loaded.neutralProtection === undefined ||
                 loaded.faceSelectionMode === undefined ||
                 loaded.layerName === undefined ||
                 loaded.skipNoFace === undefined
@@ -1709,6 +1769,7 @@ function faceColorMatchApplyHistory() {
                 strength: 100,
                 lightnessBalance: 0,
                 protectionBias: 0,
+                neutralProtection: 0,
                 faceSelectionMode: "main",
                 layerName: "Face Color Match",
                 skipNoFace: false
@@ -1754,6 +1815,14 @@ function faceColorMatchApplyHistory() {
                     Math.round(Number(d.protectionBias) || 0)
                 )
             );
+            d.neutralProtection = Math.max(
+                0,
+                Math.min(
+                    100,
+                    Math.round(Number(d.neutralProtection) || 0)
+                )
+            );
+            try { delete d.protectNeutrals; } catch (_) { }
             d.faceSelectionMode = String(d.faceSelectionMode || "main");
             if (d.faceSelectionMode != "central_average")
                 d.faceSelectionMode = "main";
@@ -1784,6 +1853,7 @@ function faceColorMatchApplyHistory() {
                 strength: "Сила",
                 lightnessBalance: "Тени / света",
                 protectionBias: "Точность / защита",
+                neutralProtection: "Защита нейтралей",
                 apply: "Применить",
                 cancel: "Отмена",
                 ok: "OK",
@@ -1796,6 +1866,7 @@ function faceColorMatchApplyHistory() {
                 strengthHelp: "Общая сила применения найденной коррекции. 100% — полный эффект, меньшие значения ослабляют все созданные корректирующие слои как одну группу.",
                 lightnessBalanceHelp: "Приоритет коррекции светлоты по тональному диапазону. 0 = Auto. Отрицательные значения заметнее смещают коррекцию в тени, положительные — в света. Направление осветления или затемнения по-прежнему определяет образец. Крайние положения дополнительно перераспределяют силу между теневой и световой частью гладкой Tone-кривой, сохраняя проверки её безопасности.",
                 protectionBiasHelp: "Баланс точности и сохранности изображения. 0 = Auto. В сторону «Точность» алгоритм сильнее стремится к минимальному ΔE, плавно снижает минимальный требуемый выигрыш и может повышать силу Skin Match до 150%. В крайнем положении LUT принимается при любом измеримом уменьшении ΔE, пока он сохраняет плавность, локальную обратимость и градации. В сторону «Защита» максимальная сила снижается до 60%, а проверки становятся строже.",
+                neutralProtectionHelp: "Защита серых и белых объектов от паразитного оттенка White Balance. 0% — дополнительный LUT не создаётся. При значении выше 0 создаётся Neutral Protect LUT с максимальной геометрически безопасной нейтрализацией, а ползунок линейно управляет прозрачностью его слоя. White Balance сохраняется.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Измерить текущий документ: добавить его к усреднённому эталону или полностью заменить эталон",
                 presetNamePrompt: "Имя нового пресета:",
@@ -1867,6 +1938,7 @@ function faceColorMatchApplyHistory() {
                 strength: "Strength",
                 lightnessBalance: "Shadows / highlights",
                 protectionBias: "Accuracy / safety",
+                neutralProtection: "Neutral protection",
                 apply: "Apply",
                 cancel: "Cancel",
                 ok: "OK",
@@ -1879,6 +1951,7 @@ function faceColorMatchApplyHistory() {
                 strengthHelp: "Overall strength of the fitted correction. 100% keeps the full effect; lower values reduce the opacity of the created adjustment group.",
                 lightnessBalanceHelp: "Tonal priority for lightness matching. 0 = Auto. Negative values shift correction more noticeably toward shadows; positive values toward highlights. The reference still determines whether each range is brightened or darkened. The extremes also redistribute strength between the shadow and highlight parts of the smooth Tone curve while keeping all safety checks.",
                 protectionBiasHelp: "Accuracy versus image protection. 0 = Auto. Toward Accuracy, the algorithm prioritizes minimum ΔE, progressively lowers the required gain and may raise Skin Match up to 150%. At maximum Accuracy, any measurable ΔE reduction is accepted while the LUT must remain smooth, locally invertible and gradation-safe. Safety lowers the maximum to 60% and tightens validation.",
+                neutralProtectionHelp: "Protects gray and white objects from unwanted White Balance tint. 0% creates no extra LUT. Above 0, a maximally geometry-safe Neutral Protect LUT is created and the slider linearly controls that layer opacity. White Balance remains active.",
                 historyApplyMatch: "Face Color Match",
                 updatePresetHelp: "Measure the current document: add it to the averaged reference or replace the reference completely",
                 presetNamePrompt: "New preset name:",
@@ -1952,7 +2025,8 @@ function faceColorMatchApplyHistory() {
     function documentSummary() {
         try {
             var d = app.activeDocument;
-            return  d.name + "  •  " + d.colorProfileName;
+            return d.width.as("px") + "×" + d.height.as("px") +
+                " px  •  " + d.name;
         } catch (_) {
             return app.activeDocument.name;
         }
